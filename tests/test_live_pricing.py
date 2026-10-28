@@ -181,3 +181,54 @@ def test_live_hotel_offers_contain_no_invented_fields(monkeypatch):
         assert offer.get("taxes_estimate_inr") is None
 
 
+HTML_3_CARDS_FIXTURE = """
+<html>
+<body>
+  <div>
+    <h2>Hotel NoPrice</h2>
+    <p>Sold out / No rates available</p>
+  </div>
+  <c-wiz>
+    <h2>Hotel Low</h2>
+    <span>₹2,500</span>
+  </c-wiz>
+  <c-wiz>
+    <h2>Hotel High</h2>
+    <span>₹7,800</span>
+  </c-wiz>
+</body>
+</html>
+"""
+
+
+def test_hotel_card_scoping_with_three_cards():
+    # Test hand-written 3-card fixture:
+    # 1. Hotel NoPrice: has no price, must be skipped and NOT inherit neighbour's price
+    # 2. Hotel Low: price 2500
+    # 3. Hotel High: price 7800
+    hotels = live_pricing._parse_google_travel_hotels(HTML_3_CARDS_FIXTURE)
+    names = [h["hotel"] for h in hotels]
+    assert "Hotel NoPrice" not in names
+    assert len(hotels) == 2
+    assert hotels[0]["hotel"] == "Hotel Low"
+    assert hotels[0]["price_per_night_inr"] == 2500
+    assert hotels[1]["hotel"] == "Hotel High"
+    assert hotels[1]["price_per_night_inr"] == 7800
+
+
+# NOTE: Save one real Google Travel response as `tests/fixtures/google_travel_sample.html`
+# and this test will validate parser behavior against real-world Google Travel markup.
+def test_real_google_travel_sample_fixture_if_present(tmp_path):
+    import pathlib
+    fixture_path = pathlib.Path("tests/fixtures/google_travel_sample.html")
+    if not fixture_path.exists():
+        pytest.skip("tests/fixtures/google_travel_sample.html not present. Please save a real Google Travel response there.")
+    html = fixture_path.read_text(encoding="utf-8")
+    hotels = live_pricing._parse_google_travel_hotels(html)
+    assert len(hotels) > 0
+    for h in hotels:
+        assert h["price_per_night_inr"] >= 600
+        assert h["hotel"]
+
+
+

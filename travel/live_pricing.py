@@ -439,16 +439,9 @@ def _build_hotel_offer(
     }
 
 
-def _scrape_live_hotels_google(city: str, check_in: str, check_out: str) -> List[Dict[str, Any]]:
-    """Scrapes live hotel rates from Google Travel strictly isolating card subtrees."""
-    client = primp.Client(impersonate="chrome_145", impersonate_os="macos", referer=True, cookie_store=True)
-    query = f"hotels in {city} from {check_in} to {check_out}"
-    url = f"https://www.google.com/travel/search?q={query.replace(' ', '+')}&curr=INR"
-    res = client.get(url, timeout=12)
-    if res.status_code != 200:
-        raise RuntimeError(f"Google Travel returned status {res.status_code}")
-
-    tree = LexborHTMLParser(res.text)
+def _parse_google_travel_hotels(html: str, deep_link_url: str = "") -> List[Dict[str, Any]]:
+    """Parse hotel names and nightly rates from Google Travel search results HTML."""
+    tree = LexborHTMLParser(html)
     hotels = []
     seen = set()
 
@@ -469,7 +462,7 @@ def _scrape_live_hotels_google(city: str, check_in: str, check_out: str) -> List
                 break
             card = card.parent
 
-        if not card:
+        if card is None or card.tag in ("body", "html"):
             continue
 
         # Search for prices ONLY inside this card's text, never climbing higher
@@ -495,12 +488,24 @@ def _scrape_live_hotels_google(city: str, check_in: str, check_out: str) -> List
         hotels.append({
             "hotel": title,
             "price_per_night_inr": price_val,
-            "deep_link": url
+            "deep_link": deep_link_url
         })
         if len(hotels) >= 20:  # Collect candidate pool for filtering
             break
 
     return hotels
+
+
+def _scrape_live_hotels_google(city: str, check_in: str, check_out: str) -> List[Dict[str, Any]]:
+    """Scrapes live hotel rates from Google Travel strictly isolating card subtrees."""
+    client = primp.Client(impersonate="chrome_145", impersonate_os="macos", referer=True, cookie_store=True)
+    query = f"hotels in {city} from {check_in} to {check_out}"
+    url = f"https://www.google.com/travel/search?q={query.replace(' ', '+')}&curr=INR"
+    res = client.get(url, timeout=12)
+    if res.status_code != 200:
+        raise RuntimeError(f"Google Travel returned status {res.status_code}")
+
+    return _parse_google_travel_hotels(res.text, deep_link_url=url)
 
 
 def search_live_hotels(
