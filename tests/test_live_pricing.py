@@ -232,4 +232,83 @@ def test_real_google_travel_sample_fixture_if_present():
         assert h["hotel"]
 
 
+def _make_mock_flight_item(airline="IndiGo", dep_time=(11, 0), dur=120, stops=0, price=4000):
+    from unittest.mock import MagicMock
+    legs = []
+    for _ in range(stops + 1):
+        leg = MagicMock()
+        leg.departure = MagicMock(time=dep_time)
+        leg.duration = dur // (stops + 1)
+        legs.append(leg)
+    item = MagicMock()
+    item.flights = legs
+    item.airlines = [airline]
+    item.price = price
+    return item
+
+
+def test_roundtrip_both_ok_includes_fare_basis_and_return_stops(monkeypatch):
+    import fast_flights
+
+    out_item = _make_mock_flight_item(airline="Air India", dep_time=(8, 0), dur=130, stops=0, price=5000)
+    ret_item = _make_mock_flight_item(airline="IndiGo", dep_time=(18, 0), dur=140, stops=1, price=4500)
+
+    def mock_get_flights(query):
+        # Determine whether it's outbound or return
+        # Outbound query has DEL -> BOM; Return has BOM -> DEL
+        if "DEL" in str(query.flight_data[0].from_airport):
+            return [out_item]
+        else:
+            return [ret_item]
+
+    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", passengers=1, return_date="2026-11-25", use_cache=False)
+    assert "results" in res
+    assert len(res["results"]) == 1
+    offer = res["results"][0]
+    assert offer["fare_basis"] == "sum_of_one_way_fares"
+    assert offer["return_stops"] == 1
+    assert offer["stops"] == 0
+    assert offer["fare_per_person_inr"] == 9500
+    assert "tfs=" in offer["deep_link"]
+
+
+def test_roundtrip_out_ok_return_empty_returns_empty_results(monkeypatch):
+    import fast_flights
+
+    out_item = _make_mock_flight_item()
+
+    def mock_get_flights(query):
+        if "DEL" in str(query.flight_data[0].from_airport):
+            return [out_item]
+        return []
+
+    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", passengers=1, return_date="2026-11-25", use_cache=False)
+    assert res.get("error") is None
+    assert res["results"] == []
+    assert "No return flights found" in res["message"] or "No flights found" in res["message"]
+    assert "IndiGo" not in str(res["results"])
+
+
+def test_roundtrip_out_ok_return_raises_returns_provider_error(monkeypatch):
+    import fast_flights
+
+    out_item = _make_mock_flight_item()
+
+    def mock_get_flights(query):
+        if "DEL" in str(query.flight_data[0].from_airport):
+            return [out_item]
+        raise ConnectionError("Return flight endpoint unreachable")
+
+    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", passengers=1, return_date="2026-11-25", use_cache=False)
+    assert res.get("error") == "PROVIDER_UNAVAILABLE"
+    assert "results" not in res
+
+
+
 

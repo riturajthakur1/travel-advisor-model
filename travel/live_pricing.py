@@ -291,19 +291,51 @@ def search_live_flights(
 
         if return_date:
             # For round-trip: fetch return flights and pair them cleanly
-            q_ret = fast_flights.create_query(
-                flights=[fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code)],
-                currency="INR",
-                trip="one-way",
-                passengers=passengers_obj
-            )
-            flight_results_ret = fast_flights.get_flights(q_ret)
+            try:
+                q_ret = fast_flights.create_query(
+                    flights=[fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code)],
+                    currency="INR",
+                    trip="one-way",
+                    passengers=passengers_obj
+                )
+                flight_results_ret = fast_flights.get_flights(q_ret)
+            except Exception:
+                logger.exception("Return flight provider search failed for %s -> %s on %s", dest_code, orig_code, return_date)
+                return {"error": "PROVIDER_UNAVAILABLE", "message": "Return flight search provider is currently unavailable. Please try again later."}
 
             out_list = list(flight_results_out)[:4]
             ret_list = list(flight_results_ret)[:4]
 
-            # Deep link for round-trip search
-            roundtrip_link = f"https://www.google.com/travel/flights?q=roundtrip+flights+from+{orig_code}+to+{dest_code}+from+{date}+to+{return_date}&curr=INR"
+            if not ret_list:
+                return {
+                    "checked_at": now_iso,
+                    "results": [],
+                    "message": f"No return flights found from {dest_code} to {orig_code} on {return_date}",
+                    "source": "Google Flights (Live)",
+                    "cached": False,
+                }
+
+            # Deep link for round-trip search using tfs parameter if available
+            tfs_rt = None
+            try:
+                q_rt = fast_flights.create_query(
+                    flights=[
+                        fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code),
+                        fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code),
+                    ],
+                    trip="round-trip",
+                    currency="INR",
+                    passengers=passengers_obj,
+                )
+                tfs_rt = q_rt.params().get("tfs")
+            except Exception:
+                pass
+
+            roundtrip_link = (
+                f"https://www.google.com/travel/flights?tfs={tfs_rt}&curr=INR"
+                if tfs_rt
+                else f"https://www.google.com/travel/flights?q=roundtrip+flights+from+{orig_code}+to+{dest_code}+from+{date}+to+{return_date}&curr=INR"
+            )
 
             for idx, (out_item, ret_item) in enumerate(zip(out_list, ret_list)):
                 out_legs, ret_legs = out_item.flights, ret_item.flights
@@ -331,6 +363,8 @@ def search_live_flights(
                     "duration_min": out_dur,
                     "return_duration_min": ret_dur,
                     "stops": len(out_legs) - 1,
+                    "return_stops": len(ret_legs) - 1,
+                    "fare_basis": "sum_of_one_way_fares",
                     "fare_per_person_inr": fare_per_person,
                     "passengers": pax,
                     "total_inr": total,
