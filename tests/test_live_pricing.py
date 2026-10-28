@@ -1,5 +1,7 @@
 """Unit tests for travel.live_pricing."""
+import contextlib
 import datetime as dt
+from pathlib import Path
 import sqlite3
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
@@ -9,6 +11,7 @@ from travel import live_pricing
 from travel.offer_schemas import validate_offer
 
 _ORIGINAL_SCRAPE_HOTELS = live_pricing._scrape_live_hotels_google
+FIXTURE = Path(__file__).parent / "fixtures" / "google_travel_sample.html"
 
 TODAY_IST = dt.datetime.now(ZoneInfo("Asia/Kolkata")).date()
 DATE_FUTURE_1 = (TODAY_IST + dt.timedelta(days=30)).isoformat()
@@ -185,8 +188,9 @@ def test_cache_hit_miss_and_ttl_expiry(monkeypatch, tmp_path):
 
     # 3. Simulate TTL expiry in sqlite db
     test_db = tmp_path / "test_pricing_cache.db"
-    with sqlite3.connect(test_db) as conn:
-        conn.execute("UPDATE price_cache SET expires_at = datetime('now', '-1 hour')")
+    with contextlib.closing(sqlite3.connect(test_db)) as conn:
+        with conn:
+            conn.execute("UPDATE price_cache SET expires_at = datetime('now', '-1 hour')")
 
     # 4. Third call -> Expired -> Cache Miss
     res3 = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
@@ -200,7 +204,7 @@ def test_error_and_provider_failures_are_never_cached(monkeypatch, tmp_path):
     assert res.get("error") == "PROVIDER_UNAVAILABLE"
 
     test_db = tmp_path / "test_pricing_cache.db"
-    with sqlite3.connect(test_db) as conn:
+    with contextlib.closing(sqlite3.connect(test_db)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM price_cache").fetchone()[0]
     assert count == 0
 
@@ -295,13 +299,44 @@ def test_flight_flights_not_found_returns_clear_message_and_link(monkeypatch):
 # --- Live Offers Contain No Invented Fields ---
 
 def _make_mock_flight_item(airline="IndiGo", dep_time=(11, 0), dur=120, stops=0, price=4000):
+    start_dt = dt.datetime(2026, 11, 20, *dep_time)
     legs = []
-    for _ in range(stops + 1):
+    if stops == 0:
+        arr_dt = start_dt + dt.timedelta(minutes=dur)
         leg = MagicMock()
-        leg.departure = MagicMock(date=(2026, 11, 20), time=dep_time)
-        leg.arrival = MagicMock(date=(2026, 11, 20), time=(dep_time[0] + dur // 60, dep_time[1] + dur % 60))
-        leg.duration = dur // (stops + 1)
+        leg.departure = MagicMock(date=(start_dt.year, start_dt.month, start_dt.day), time=(start_dt.hour, start_dt.minute))
+        leg.arrival = MagicMock(date=(arr_dt.year, arr_dt.month, arr_dt.day), time=(arr_dt.hour, arr_dt.minute))
+        leg.duration = dur
         legs.append(leg)
+    else:
+        # Chain multi-leg items sequentially with a real layover gap
+        layover_gap = 30
+        total_layovers = stops * layover_gap
+        if dur > total_layovers:
+            total_flight_time = dur - total_layovers
+        else:
+            layover_gap = max(5, (dur // (stops + 1)) // 2)
+            total_layovers = stops * layover_gap
+            total_flight_time = dur - total_layovers
+
+        flight_per_leg = total_flight_time // (stops + 1)
+        cur_dt = start_dt
+        for s in range(stops + 1):
+            if s == stops:
+                leg_arr = start_dt + dt.timedelta(minutes=dur)
+                leg_dur = int((leg_arr - cur_dt).total_seconds() // 60)
+            else:
+                leg_dur = flight_per_leg
+                leg_arr = cur_dt + dt.timedelta(minutes=leg_dur)
+
+            leg = MagicMock()
+            leg.departure = MagicMock(date=(cur_dt.year, cur_dt.month, cur_dt.day), time=(cur_dt.hour, cur_dt.minute))
+            leg.arrival = MagicMock(date=(leg_arr.year, leg_arr.month, leg_arr.day), time=(leg_arr.hour, leg_arr.minute))
+            leg.duration = leg_dur
+            legs.append(leg)
+
+            cur_dt = leg_arr + dt.timedelta(minutes=layover_gap)
+
     item = MagicMock()
     item.flights = legs
     item.airlines = [airline]
@@ -309,7 +344,7 @@ def _make_mock_flight_item(airline="IndiGo", dep_time=(11, 0), dur=120, stops=0,
     return item
 
 
-def test_flight_parsing_with_fake_fast_flights(monkeypatch):
+def test_flight_parsing_with_fake_fast_flights(monkeypatch, caplog):
     import fast_flights
 
     out_item = _make_mock_flight_item(airline="Vistara", dep_time=(6, 45), dur=135, stops=0, price=5200)
@@ -318,6 +353,7 @@ def test_flight_parsing_with_fake_fast_flights(monkeypatch):
     res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=2, use_cache=False)
     assert res.get("error") is None
     assert len(res["results"]) == 1
+    assert "Could not compute elapsed duration" not in caplog.text
     offer = res["results"][0]
     assert offer["airline"] == "Vistara"
     assert offer["departs"] == "06:45"
@@ -351,23 +387,18 @@ def test_live_hotel_offers_contain_no_invented_fields(monkeypatch):
 
 # --- Round-trip Flights ---
 
-def test_roundtrip_both_ok_includes_fare_basis_and_return_stops(monkeypatch):
+def test_roundtrip_both_ok_includes_fare_basis_and_return_stops(monkeypatch, caplog):
     import fast_flights
 
     out_item = _make_mock_flight_item(airline="Air India", dep_time=(8, 0), dur=130, stops=0, price=5000)
     ret_item = _make_mock_flight_item(airline="IndiGo", dep_time=(18, 0), dur=140, stops=1, price=4500)
 
-    def mock_get_flights(query):
-        if "DEL" in str(query.flight_data[0].from_airport):
-            return [out_item]
-        else:
-            return [ret_item]
-
-    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=[[out_item], [ret_item]]))
 
     res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=1, return_date=DATE_FUTURE_2, use_cache=False)
     assert "results" in res
     assert len(res["results"]) == 1
+    assert "Could not compute elapsed duration" not in caplog.text
     offer = res["results"][0]
     assert offer["fare_basis"] == "sum_of_one_way_fares"
     assert offer["return_stops"] == 1
@@ -380,13 +411,7 @@ def test_roundtrip_out_ok_return_empty_returns_empty_results(monkeypatch):
     import fast_flights
 
     out_item = _make_mock_flight_item()
-
-    def mock_get_flights(query):
-        if "DEL" in str(query.flight_data[0].from_airport):
-            return [out_item]
-        return []
-
-    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=[[out_item], []]))
 
     res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=1, return_date=DATE_FUTURE_2, use_cache=False)
     assert res.get("error") is None
@@ -398,13 +423,7 @@ def test_roundtrip_out_ok_return_raises_returns_provider_error(monkeypatch):
     import fast_flights
 
     out_item = _make_mock_flight_item()
-
-    def mock_get_flights(query):
-        if "DEL" in str(query.flight_data[0].from_airport):
-            return [out_item]
-        raise ConnectionError("Return flight endpoint unreachable")
-
-    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=[[out_item], ConnectionError("Return flight endpoint unreachable")]))
 
     res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=1, return_date=DATE_FUTURE_2, use_cache=False)
     assert res.get("error") == "PROVIDER_UNAVAILABLE"
@@ -466,11 +485,7 @@ def test_validate_offer_on_mocked_scenarios(monkeypatch):
 
     # 2. Round-trip flight offer
     ret_item = _make_mock_flight_item(airline="IndiGo", dep_time=(18, 0), dur=140, stops=1, price=4500)
-    def mock_get_flights(query):
-        if "DEL" in str(query.flight_data[0].from_airport):
-            return [out_item]
-        return [ret_item]
-    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=[[out_item], [ret_item]]))
     res_rt = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=1, return_date=DATE_FUTURE_2, use_cache=False)
     for offer in res_rt["results"]:
         problems = validate_offer(offer, kind="flight", roundtrip=True)
@@ -601,15 +616,11 @@ def test_card_tag_exact_cwiz_match():
 
 
 
-@pytest.mark.skip(reason="needs real saved response")
+@pytest.mark.skipif(not FIXTURE.exists(), reason="needs real saved response")
 def test_real_google_travel_sample_fixture_if_present():
-    import pathlib
-    fixture_path = pathlib.Path("tests/fixtures/google_travel_sample.html")
-    if not fixture_path.exists():
-        return
-    html = fixture_path.read_text(encoding="utf-8")
+    html = FIXTURE.read_text(encoding="utf-8")
     hotels = live_pricing._parse_google_travel_hotels(html)
     assert len(hotels) > 0
     for h in hotels:
-        assert h["price_per_night_inr"] >= 600
+        assert h["price_per_night_inr"] >= live_pricing.MIN_HOTEL_PRICE_INR
         assert h["hotel"]
