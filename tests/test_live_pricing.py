@@ -407,7 +407,7 @@ def test_roundtrip_both_ok_includes_fare_basis_and_return_stops(monkeypatch, cap
 
     monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=[[out_item], [ret_item]]))
 
-    res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=1, return_date=DATE_FUTURE_2, use_cache=False)
+    res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=2, return_date=DATE_FUTURE_2, use_cache=False)
     assert "results" in res
     assert len(res["results"]) == 1
     assert "Could not compute elapsed duration" not in caplog.text
@@ -416,6 +416,8 @@ def test_roundtrip_both_ok_includes_fare_basis_and_return_stops(monkeypatch, cap
     assert offer["return_stops"] == 1
     assert offer["stops"] == 0
     assert offer["fare_per_person_inr"] == 9500
+    assert offer["passengers"] == 2
+    assert offer["total_inr"] == 19000
     assert "tfs=" in offer["deep_link"]
 
 
