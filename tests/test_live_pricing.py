@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from travel import live_pricing
+from travel.offer_schemas import validate_offer
 
 TODAY_IST = dt.datetime.now(ZoneInfo("Asia/Kolkata")).date()
 DATE_FUTURE_1 = (TODAY_IST + dt.timedelta(days=30)).isoformat()
@@ -406,7 +407,72 @@ def test_fast_flights_missing_handled_gracefully(monkeypatch):
     assert "fast-flights" in res["message"] or "unavailable" in res["message"].lower()
 
 
-# --- HTML Parsing Fixtures ---
+# --- Contract Schema Validation (travel.offer_schemas) ---
+
+def test_validate_offer_on_mocked_scenarios(monkeypatch):
+    import fast_flights
+
+    # 1. One-way flight offer
+    out_item = _make_mock_flight_item(airline="Vistara", dep_time=(6, 45), dur=135, stops=0, price=5200)
+    monkeypatch.setattr(fast_flights, "get_flights", lambda *a, **kw: [out_item])
+    res_flight = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=2, use_cache=False)
+    for offer in res_flight["results"]:
+        problems = validate_offer(offer, kind="flight", roundtrip=False)
+        assert problems == [], f"Flight offer schema problems: {problems}"
+
+    # 2. Round-trip flight offer
+    ret_item = _make_mock_flight_item(airline="IndiGo", dep_time=(18, 0), dur=140, stops=1, price=4500)
+    def mock_get_flights(query):
+        if "DEL" in str(query.flight_data[0].from_airport):
+            return [out_item]
+        return [ret_item]
+    monkeypatch.setattr(fast_flights, "get_flights", mock_get_flights)
+    res_rt = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=1, return_date=DATE_FUTURE_2, use_cache=False)
+    for offer in res_rt["results"]:
+        problems = validate_offer(offer, kind="flight", roundtrip=True)
+        assert problems == [], f"Round-trip offer schema problems: {problems}"
+
+    # 3. Hotel offer
+    mock_hotels = [{"hotel": "Lake Palace", "price_per_night_inr": 15000, "deep_link": "https://google.com/travel/..."}]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: mock_hotels)
+    res_hotel = live_pricing.search_live_hotels("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=False)
+    for offer in res_hotel["results"]:
+        problems = validate_offer(offer, kind="hotel")
+        assert problems == [], f"Hotel offer schema problems: {problems}"
+
+
+def test_validate_offer_catches_schema_violations():
+    valid_flight = {
+        "offer_id": "F-DEL-BOM-1", "airline": "IndiGo", "from": "DEL", "to": "BOM",
+        "date": "2026-12-01", "departs": "10:00", "duration_min": 120, "stops": 0,
+        "fare_per_person_inr": 4000, "passengers": 1, "total_inr": 4000,
+        "baggage": None, "fare_rule": None, "is_live": True, "deep_link": "http://..."
+    }
+
+    # Missing key
+    missing_key_offer = dict(valid_flight)
+    del missing_key_offer["airline"]
+    assert any("Missing required key" in p for p in validate_offer(missing_key_offer, "flight"))
+
+    # Unexpected key
+    unexpected_offer = dict(valid_flight, extra_bogus_field="surprise")
+    assert any("Unexpected key" in p for p in validate_offer(unexpected_offer, "flight"))
+
+    # Wrong type (string for int)
+    wrong_type_offer = dict(valid_flight, duration_min="two hours")
+    assert any("must be an int" in p for p in validate_offer(wrong_type_offer, "flight"))
+
+    # None in non-nullable field
+    none_non_nullable = dict(valid_flight, total_inr=None)
+    assert any("is None but is not nullable" in p for p in validate_offer(none_non_nullable, "flight"))
+
+    # Bool passed as int
+    bool_as_int = dict(valid_flight, stops=True)
+    assert any("must be an int" in p for p in validate_offer(bool_as_int, "flight"))
+
+    # Non-dict offer
+    assert "Offer must be a dictionary" in validate_offer("not-a-dict", "flight")[0]
+
 
 HTML_3_CARDS_FIXTURE = """
 <html>
