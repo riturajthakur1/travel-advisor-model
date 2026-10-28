@@ -711,25 +711,31 @@ def search_live_hotels(
         if cap < MIN_HOTEL_PRICE_INR:
             return {"checked_at": now_iso, "results": [], "message": f"No hotels found at or below ₹{int(cap)} per night"}
 
-    cache_key = f"hotels:{clean_city}:{check_in}:{check_out}:{guest_count}:{cap}"
+    cache_key = f"hotels_scrape:{clean_city}:{check_in}:{check_out}"
+    live_hotels = None
+    is_cached = False
+
     if use_cache:
-        cached = _get_from_cache(cache_key)
-        if cached:
-            cached["cached"] = True
-            return cached
+        cached_entry = _get_from_cache(cache_key)
+        if cached_entry and isinstance(cached_entry.get("hotels"), list):
+            live_hotels = cached_entry["hotels"]
+            is_cached = True
 
-    # Attempt live scraping from Google Travel
-    try:
-        live_hotels = _scrape_live_hotels_google(clean_city, check_in, check_out)
-    except (ProviderError, primp.PrimpError, OSError) as e:
-        logger.exception("Hotel provider search failed for %s from %s to %s: %s", clean_city, check_in, check_out, e)
-        return {"error": "PROVIDER_UNAVAILABLE", "message": "Hotel search provider is currently unavailable. Please try again later."}
+    if live_hotels is None:
+        # Attempt live scraping from Google Travel
+        try:
+            live_hotels = _scrape_live_hotels_google(clean_city, check_in, check_out)
+        except (ProviderError, primp.PrimpError, OSError) as e:
+            logger.exception("Hotel provider search failed for %s from %s to %s: %s", clean_city, check_in, check_out, e)
+            return {"error": "PROVIDER_UNAVAILABLE", "message": "Hotel search provider is currently unavailable. Please try again later."}
 
-    if not live_hotels:
-        return {
-            "error": "PROVIDER_RESPONSE_UNREADABLE",
-            "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."
-        }
+        if not live_hotels:
+            return {
+                "error": "PROVIDER_RESPONSE_UNREADABLE",
+                "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."
+            }
+
+        _save_to_cache(cache_key, "hotels", {"hotels": live_hotels}, ttl_hours=CACHE_TTL_HOURS)
 
     city_code = resolve_iata(clean_city) or clean_city[:3].upper()
     date_clean = check_in.replace("-", "")
@@ -768,7 +774,7 @@ def search_live_hotels(
             "results": [],
             "message": f"No hotels found in {clean_city} at or below ₹{int(cap)} per night",
             "source": "Google Travel Hotels (Live)",
-            "cached": False
+            "cached": is_cached
         }
 
     if not results:
@@ -777,15 +783,12 @@ def search_live_hotels(
             "results": [],
             "message": f"No hotels found in {clean_city} for {check_in} to {check_out}",
             "source": "Google Travel Hotels (Live)",
-            "cached": False
+            "cached": is_cached
         }
 
-    payload = {
+    return {
         "checked_at": now_iso,
         "results": results,
         "source": "Google Travel Hotels (Live)",
-        "cached": False
+        "cached": is_cached
     }
-
-    _save_to_cache(cache_key, "hotels", payload, ttl_hours=CACHE_TTL_HOURS)
-    return payload

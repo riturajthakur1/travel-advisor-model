@@ -87,8 +87,8 @@ MUTATIONS = [
     {
         "id": 13,
         "name": "zero-cards -> returns empty success instead of PROVIDER_RESPONSE_UNREADABLE",
-        "target": 'if not live_hotels:\n        return {\n            "error": "PROVIDER_RESPONSE_UNREADABLE",\n            "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."\n        }',
-        "replacement": 'if not live_hotels:\n        return {\n            "checked_at": now_iso,\n            "results": [],\n            "source": "Google Travel Hotels (Live)",\n            "cached": False\n        }',
+        "target": '"error": "PROVIDER_RESPONSE_UNREADABLE",\n                "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."',
+        "replacement": '"checked_at": now_iso,\n                "results": [],\n                "source": "Google Travel Hotels (Live)",\n                "cached": False',
     },
     {
         "id": 14,

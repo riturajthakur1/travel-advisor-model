@@ -806,6 +806,29 @@ def test_hotel_search_pool_limiting_and_total_calculation(monkeypatch):
     assert "No hotels found at or below ₹500 per night" in res_below_min["message"]
 
 
+def test_hotel_unfiltered_cache_reuse_across_budgets(monkeypatch):
+    mock_hotels = [
+        {"hotel": "Budget Inn", "price_per_night_inr": 2000, "deep_link": "http://..."},
+        {"hotel": "Luxury Palace", "price_per_night_inr": 8000, "deep_link": "http://..."},
+    ]
+    mock_scrape = MagicMock(return_value=mock_hotels)
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", mock_scrape)
+
+    # First call with budget 3000
+    res1 = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, max_price_per_night=3000, use_cache=True)
+    assert res1["cached"] is False
+    assert len(res1["results"]) == 1
+    assert res1["results"][0]["hotel"] == "Budget Inn"
+    assert mock_scrape.call_count == 1
+
+    # Second call with different budget 10000 on same city/dates should reuse scrape from cache
+    res2 = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, max_price_per_night=10000, use_cache=True)
+    assert res2["cached"] is True
+    assert len(res2["results"]) == 2
+    assert mock_scrape.call_count == 1, "Scraper should not be called again for same city and dates"
+
+
+
 
 
 @pytest.mark.skipif(not FIXTURE.exists(), reason="needs real saved response")
