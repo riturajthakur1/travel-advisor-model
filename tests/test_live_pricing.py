@@ -310,5 +310,47 @@ def test_roundtrip_out_ok_return_raises_returns_provider_error(monkeypatch):
     assert "results" not in res
 
 
+def test_programming_error_in_flight_processing_is_not_disguised_as_provider_offline(monkeypatch):
+    from unittest.mock import MagicMock
+    import fast_flights
+
+    # Return a malformed object that causes an AttributeError or TypeError during post-processing
+    bad_item = MagicMock()
+    bad_item.flights = "not-a-list-of-legs"  # causing len() or index error
+    bad_item.airlines = ["IndiGo"]
+    bad_item.price = 4500
+
+    monkeypatch.setattr(fast_flights, "get_flights", lambda *a, **kw: [bad_item])
+
+    with pytest.raises((TypeError, AttributeError)):
+        live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", use_cache=False)
+
+
+def test_calc_elapsed_minutes_with_layover():
+    from unittest.mock import MagicMock
+    leg1 = MagicMock()
+    leg1.departure = MagicMock(date=(2026, 11, 20), time=(10, 0))
+    leg1.arrival = MagicMock(date=(2026, 11, 20), time=(12, 0))
+    leg1.duration = 120
+
+    # 1.5 hour layover between 12:00 and 13:30
+    leg2 = MagicMock()
+    leg2.departure = MagicMock(date=(2026, 11, 20), time=(13, 30))
+    leg2.arrival = MagicMock(date=(2026, 11, 20), time=(15, 30))
+    leg2.duration = 120
+
+    # Total elapsed should be 10:00 to 15:30 = 330 minutes (not 120 + 120 = 240)
+    dur = live_pricing._calc_elapsed_minutes([leg1, leg2])
+    assert dur == 330
+
+
+def test_fast_flights_missing_handled_gracefully(monkeypatch):
+    monkeypatch.setattr(live_pricing, "fast_flights", None)
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", use_cache=False)
+    assert res.get("error") == "PROVIDER_UNAVAILABLE"
+    assert "fast-flights" in res["message"] or "unavailable" in res["message"].lower()
+
+
+
 
 

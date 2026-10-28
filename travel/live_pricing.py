@@ -29,6 +29,13 @@ from zoneinfo import ZoneInfo
 import primp
 from selectolax.lexbor import LexborHTMLParser
 
+try:
+    import fast_flights
+    import fast_flights.exceptions as _ff_exceptions
+except ImportError:
+    fast_flights = None
+    _ff_exceptions = None
+
 logger = logging.getLogger(__name__)
 
 # Valid Indian airports
@@ -164,9 +171,9 @@ def _get_from_cache(cache_key: str) -> Optional[Dict[str, Any]]:
             if row:
                 return json.loads(row[0])
     except sqlite3.Error as e:
-        logger.warning(f"Cache read error: {e}")
+        logger.warning("Cache read error: %s", e)
     except json.JSONDecodeError as e:
-        logger.warning(f"Cache JSON decode error: {e}")
+        logger.warning("Cache JSON decode error: %s", e)
     return None
 
 
@@ -179,7 +186,7 @@ def _save_to_cache(cache_key: str, category: str, data: Dict[str, Any], ttl_hour
                     VALUES (?, ?, ?, datetime(CURRENT_TIMESTAMP, '+' || ? || ' hours'))
                 """, (cache_key, category, json.dumps(data, ensure_ascii=False), ttl_hours))
     except sqlite3.Error as e:
-        logger.warning(f"Cache write error: {e}")
+        logger.warning("Cache write error: %s", e)
 
 
 def get_current_ist_time() -> str:
@@ -206,11 +213,10 @@ def _calc_elapsed_minutes(legs) -> int:
     try:
         dep = dt.datetime(*legs[0].departure.date, *legs[0].departure.time)
         arr = dt.datetime(*legs[-1].arrival.date, *legs[-1].arrival.time)
-        if arr < dep:  # overnight arrival
-            arr += dt.timedelta(days=1)
         return int((arr - dep).total_seconds() // 60)
-    except Exception:
-        return sum(leg.duration for leg in legs)
+    except (AttributeError, TypeError, ValueError) as e:
+        logger.warning("Could not compute elapsed duration from leg timestamps (%s); summing leg durations", e)
+        return sum(getattr(leg, "duration", 0) for leg in legs)
 
 
 def search_live_flights(
@@ -271,148 +277,157 @@ def search_live_flights(
             cached["cached"] = True
             return cached
 
+    if fast_flights is None:
+        logger.error("fast-flights dependency is not installed")
+        return {"error": "PROVIDER_UNAVAILABLE", "message": "Flight search provider is currently unavailable (fast-flights dependency missing)."}
+
+    flights_not_found = getattr(_ff_exceptions, "FlightsNotFound", ()) if _ff_exceptions else ()
+    provider_errors = (primp.PrimpError, ConnectionError, TimeoutError, OSError, RuntimeError)
+
+    passengers_obj = fast_flights.Passengers(adults=pax) if pax > 1 else None
+
+    # Fetch outbound flights
+    q_out = fast_flights.create_query(
+        flights=[fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code)],
+        currency="INR",
+        trip="one-way",
+        passengers=passengers_obj
+    )
     try:
-        import fast_flights
+        flight_results_out = fast_flights.get_flights(q_out)
+    except flights_not_found:
+        flight_results_out = []
+    except provider_errors as e:
+        logger.exception("Flight provider search failed for %s -> %s on %s: %s", orig_code, dest_code, date, e)
+        return {"error": "PROVIDER_UNAVAILABLE", "message": "Flight search provider is currently unavailable. Please try again later."}
 
-        passengers_obj = fast_flights.Passengers(adults=pax) if pax > 1 else None
+    tfs_out = q_out.params().get("tfs")
 
-        # Fetch outbound flights
-        q_out = fast_flights.create_query(
-            flights=[fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code)],
+    results = []
+    date_clean = date.replace("-", "")
+
+    if return_date:
+        # For round-trip: fetch return flights and pair them cleanly
+        q_ret = fast_flights.create_query(
+            flights=[fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code)],
             currency="INR",
             trip="one-way",
             passengers=passengers_obj
         )
-        flight_results_out = fast_flights.get_flights(q_out)
-        tfs_out = q_out.params().get("tfs")
+        try:
+            flight_results_ret = fast_flights.get_flights(q_ret)
+        except flights_not_found:
+            flight_results_ret = []
+        except provider_errors as e:
+            logger.exception("Return flight provider search failed for %s -> %s on %s: %s", dest_code, orig_code, return_date, e)
+            return {"error": "PROVIDER_UNAVAILABLE", "message": "Return flight search provider is currently unavailable. Please try again later."}
 
-        results = []
-        date_clean = date.replace("-", "")
+        out_list = list(flight_results_out)[:4]
+        ret_list = list(flight_results_ret)[:4]
 
-        if return_date:
-            # For round-trip: fetch return flights and pair them cleanly
-            try:
-                q_ret = fast_flights.create_query(
-                    flights=[fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code)],
-                    currency="INR",
-                    trip="one-way",
-                    passengers=passengers_obj
-                )
-                flight_results_ret = fast_flights.get_flights(q_ret)
-            except Exception:
-                logger.exception("Return flight provider search failed for %s -> %s on %s", dest_code, orig_code, return_date)
-                return {"error": "PROVIDER_UNAVAILABLE", "message": "Return flight search provider is currently unavailable. Please try again later."}
+        if not ret_list:
+            return {
+                "checked_at": now_iso,
+                "results": [],
+                "message": f"No return flights found from {dest_code} to {orig_code} on {return_date}",
+                "source": "Google Flights (Live)",
+                "cached": False,
+            }
 
-            out_list = list(flight_results_out)[:4]
-            ret_list = list(flight_results_ret)[:4]
-
-            if not ret_list:
-                return {
-                    "checked_at": now_iso,
-                    "results": [],
-                    "message": f"No return flights found from {dest_code} to {orig_code} on {return_date}",
-                    "source": "Google Flights (Live)",
-                    "cached": False,
-                }
-
-            # Deep link for round-trip search using tfs parameter if available
-            tfs_rt = None
-            try:
-                q_rt = fast_flights.create_query(
-                    flights=[
-                        fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code),
-                        fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code),
-                    ],
-                    trip="round-trip",
-                    currency="INR",
-                    passengers=passengers_obj,
-                )
-                tfs_rt = q_rt.params().get("tfs")
-            except Exception:
-                pass
-
-            roundtrip_link = (
-                f"https://www.google.com/travel/flights?tfs={tfs_rt}&curr=INR"
-                if tfs_rt
-                else f"https://www.google.com/travel/flights?q=roundtrip+flights+from+{orig_code}+to+{dest_code}+from+{date}+to+{return_date}&curr=INR"
+        # Deep link for round-trip search using tfs parameter if available
+        tfs_rt = None
+        try:
+            q_rt = fast_flights.create_query(
+                flights=[
+                    fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code),
+                    fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code),
+                ],
+                trip="round-trip",
+                currency="INR",
+                passengers=passengers_obj,
             )
+            tfs_rt = q_rt.params().get("tfs")
+        except Exception:
+            pass
 
-            for idx, (out_item, ret_item) in enumerate(zip(out_list, ret_list)):
-                out_legs, ret_legs = out_item.flights, ret_item.flights
-                airline = out_item.airlines[0] if out_item.airlines else "Domestic Airline"
-                if ret_item.airlines and ret_item.airlines[0] != airline:
-                    airline = f"{airline} + {ret_item.airlines[0]}"
+        roundtrip_link = (
+            f"https://www.google.com/travel/flights?tfs={tfs_rt}&curr=INR"
+            if tfs_rt
+            else f"https://www.google.com/travel/flights?q=roundtrip+flights+from+{orig_code}+to+{dest_code}+from+{date}+to+{return_date}&curr=INR"
+        )
 
-                out_dep = f"{out_legs[0].departure.time[0]:02d}:{out_legs[0].departure.time[1]:02d}"
-                ret_dep = f"{ret_legs[0].departure.time[0]:02d}:{ret_legs[0].departure.time[1]:02d}"
-                out_dur = _calc_elapsed_minutes(out_legs)
-                ret_dur = _calc_elapsed_minutes(ret_legs)
-                fare_per_person = int(out_item.price + ret_item.price)
-                total = fare_per_person * pax
-                oid = f"F-{orig_code}-{dest_code}-{date_clean}-RT-{idx + 1}"
+        for idx, (out_item, ret_item) in enumerate(zip(out_list, ret_list)):
+            out_legs, ret_legs = out_item.flights, ret_item.flights
+            airline = out_item.airlines[0] if out_item.airlines else "Domestic Airline"
+            if ret_item.airlines and ret_item.airlines[0] != airline:
+                airline = f"{airline} + {ret_item.airlines[0]}"
 
-                results.append({
-                    "offer_id": oid,
-                    "airline": airline,
-                    "from": orig_code,
-                    "to": dest_code,
-                    "date": date,
-                    "return_date": return_date,
-                    "departs": out_dep,
-                    "return_departs": ret_dep,
-                    "duration_min": out_dur,
-                    "return_duration_min": ret_dur,
-                    "stops": len(out_legs) - 1,
-                    "return_stops": len(ret_legs) - 1,
-                    "fare_basis": "sum_of_one_way_fares",
-                    "fare_per_person_inr": fare_per_person,
-                    "passengers": pax,
-                    "total_inr": total,
-                    "baggage": None,
-                    "fare_rule": None,
-                    "is_live": True,
-                    "deep_link": roundtrip_link,
-                })
+            out_dep = f"{out_legs[0].departure.time[0]:02d}:{out_legs[0].departure.time[1]:02d}"
+            ret_dep = f"{ret_legs[0].departure.time[0]:02d}:{ret_legs[0].departure.time[1]:02d}"
+            out_dur = _calc_elapsed_minutes(out_legs)
+            ret_dur = _calc_elapsed_minutes(ret_legs)
+            fare_per_person = int(out_item.price + ret_item.price)
+            total = fare_per_person * pax
+            oid = f"F-{orig_code}-{dest_code}-{date_clean}-RT-{idx + 1}"
 
-        else:
-            # One-way search
-            deep_link = (
-                f"https://www.google.com/travel/flights?tfs={tfs_out}&curr=INR"
-                if tfs_out
-                else f"https://www.google.com/travel/flights?q=oneway+flights+from+{orig_code}+to+{dest_code}+on+{date}&curr=INR"
-            )
+            results.append({
+                "offer_id": oid,
+                "airline": airline,
+                "from": orig_code,
+                "to": dest_code,
+                "date": date,
+                "return_date": return_date,
+                "departs": out_dep,
+                "return_departs": ret_dep,
+                "duration_min": out_dur,
+                "return_duration_min": ret_dur,
+                "stops": len(out_legs) - 1,
+                "return_stops": len(ret_legs) - 1,
+                "fare_basis": "sum_of_one_way_fares",
+                "fare_per_person_inr": fare_per_person,
+                "passengers": pax,
+                "total_inr": total,
+                "baggage": None,
+                "fare_rule": None,
+                "is_live": True,
+                "deep_link": roundtrip_link,
+            })
 
-            for idx, item in enumerate(list(flight_results_out)[:4]):
-                legs = item.flights
-                airline = item.airlines[0] if item.airlines else "Domestic Airline"
-                dep_time = f"{legs[0].departure.time[0]:02d}:{legs[0].departure.time[1]:02d}"
-                dur_mins = _calc_elapsed_minutes(legs)
-                stops = len(legs) - 1
-                fare_per_person = int(item.price)
-                total = fare_per_person * pax
-                oid = f"F-{orig_code}-{dest_code}-{date_clean}-OW-{idx + 1}"
+    else:
+        # One-way search
+        deep_link = (
+            f"https://www.google.com/travel/flights?tfs={tfs_out}&curr=INR"
+            if tfs_out
+            else f"https://www.google.com/travel/flights?q=oneway+flights+from+{orig_code}+to+{dest_code}+on+{date}&curr=INR"
+        )
 
-                results.append({
-                    "offer_id": oid,
-                    "airline": airline,
-                    "from": orig_code,
-                    "to": dest_code,
-                    "date": date,
-                    "departs": dep_time,
-                    "duration_min": dur_mins,
-                    "stops": stops,
-                    "fare_per_person_inr": fare_per_person,
-                    "passengers": pax,
-                    "total_inr": total,
-                    "baggage": None,
-                    "fare_rule": None,
-                    "is_live": True,
-                    "deep_link": deep_link,
-                })
+        for idx, item in enumerate(list(flight_results_out)[:4]):
+            legs = item.flights
+            airline = item.airlines[0] if item.airlines else "Domestic Airline"
+            dep_time = f"{legs[0].departure.time[0]:02d}:{legs[0].departure.time[1]:02d}"
+            dur_mins = _calc_elapsed_minutes(legs)
+            stops = len(legs) - 1
+            fare_per_person = int(item.price)
+            total = fare_per_person * pax
+            oid = f"F-{orig_code}-{dest_code}-{date_clean}-OW-{idx + 1}"
 
-    except Exception:
-        logger.exception("Flight provider search failed for %s -> %s on %s", orig_code, dest_code, date)
-        return {"error": "PROVIDER_UNAVAILABLE", "message": "Flight search provider is currently unavailable. Please try again later."}
+            results.append({
+                "offer_id": oid,
+                "airline": airline,
+                "from": orig_code,
+                "to": dest_code,
+                "date": date,
+                "departs": dep_time,
+                "duration_min": dur_mins,
+                "stops": stops,
+                "fare_per_person_inr": fare_per_person,
+                "passengers": pax,
+                "total_inr": total,
+                "baggage": None,
+                "fare_rule": None,
+                "is_live": True,
+                "deep_link": deep_link,
+            })
 
     if not results:
         return {
