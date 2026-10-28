@@ -84,8 +84,12 @@ def test_harness_summary_room_handling(live_hotel_offer):
     assert "- Taj Lake Palace, Deluxe\n" in text_room
 
 
-def test_flight_offer_none_fields_summary():
-    """g) a flight offer with baggage=None and fare_rule=None summarises without 'None'."""
+def test_flight_offer_with_none_fields_regression_guard():
+    """Regression guard (not proof): verifies that flight offer summaries do not
+    leak 'None' when optional fields like baggage and fare_rule are None.
+    Note: baggage is not currently formatted into customer-facing text in harness.py
+    (only fare_rule is resolved via _rule()), so this test guards future formatters
+    from inadvertently displaying 'None' if baggage is integrated into the summary."""
     flight_offer = {
         "offer_id": "F-1",
         "airline": "Air India",
@@ -108,7 +112,7 @@ def test_flight_offer_none_fields_summary():
 
 
 def test_backend_call_tool_exception_returns_internal_error(caplog):
-    """h) backend.call: a tool function that raises returns
+    """h) backend.call: a read tool function that raises returns
     {'error': 'INTERNAL_ERROR', 'message': <generic, no traceback or exception text>}
     and logs via logger.exception; the turn does not crash."""
     b = backend.Backend(config={}, seed=42)
@@ -125,9 +129,127 @@ def test_backend_call_tool_exception_returns_internal_error(caplog):
     assert "database connection crashed" not in str(res)
     assert "secret_traceback_token" not in str(res)
     assert "traceback" not in str(res).lower()
-    assert isinstance(res.get("message"), str)
-    assert len(res["message"]) > 0
+    assert res.get("message") == "The service encountered an error while processing the request"
 
     # Ensure logger.exception was recorded
     assert any("secret_traceback_token" in record.message or (record.exc_info and "secret_traceback_token" in str(record.exc_info))
                for record in caplog.records)
+
+
+def test_backend_call_write_tool_exception_warns_outcome_not_confirmed(caplog):
+    """Step 4: backend.call for create_booking (write tool) returns an INTERNAL_ERROR
+    message stating that the outcome is not confirmed and that booking status must be
+    checked before retrying, without leaking any exception traceback."""
+    b = backend.Backend(config={}, seed=42)
+
+    def exploding_create_booking(**kwargs):
+        raise RuntimeError("network dropped during gateway commit with secret_payment_token")
+
+    b.create_booking = exploding_create_booking
+
+    with caplog.at_level(logging.ERROR):
+        res = b.call("create_booking", {"offer_id": "H-1", "travelers": 2, "total_price_inr": 10000, "customer_confirmed_terms": True})
+
+    assert res.get("error") == "INTERNAL_ERROR"
+    assert "network dropped" not in str(res)
+    assert "secret_payment_token" not in str(res)
+    assert "traceback" not in str(res).lower()
+    msg = res.get("message", "").lower()
+    assert "not confirmed" in msg
+    assert "check" in msg
+    assert "before retrying" in msg
+
+
+def test_integration_live_hotel_and_booking_through_backend_call(monkeypatch):
+    """Step 2: Integration test going through backend.call for search_hotels with
+    mocked scraper, then create_booking with correct total and all unknown fields None.
+    Asserts no exception, confirmed status, and no literal 'None' in customer text."""
+    mock_hotels = [{"hotel": "Taj Lake Palace", "price_per_night_inr": 12000, "deep_link": "https://google.com/travel/..."}]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: mock_hotels)
+
+    b = backend.Backend(config={"live_pricing": True}, seed=42)
+
+    # 1. search_hotels through backend.call
+    search_payload = b.call("search_hotels", {
+        "city": "Udaipur",
+        "check_in": "2026-12-01",
+        "check_out": "2026-12-03",
+        "guests": 2
+    })
+    assert search_payload.get("error") is None
+    assert len(search_payload["results"]) == 1
+    offer = search_payload["results"][0]
+    assert offer.get("room") is None
+    assert offer.get("amenities") is None
+    assert offer.get("rate_rule") is None
+    assert offer.get("taxes_included") is None
+    assert offer.get("taxes_estimate_inr") is None
+
+    # Summary customer-facing text check
+    summary_text = harness.summary(offer, travellers=2)
+    assert "None" not in summary_text
+    assert "Taj Lake Palace" in summary_text
+
+    # 2. create_booking through backend.call
+    booking_res = b.call("create_booking", {
+        "offer_id": offer["offer_id"],
+        "travelers": 2,
+        "total_price_inr": offer["total_inr"],
+        "customer_confirmed_terms": True,
+    })
+    assert booking_res.get("error") is None
+    assert booking_res.get("status") in ("CONFIRMED", "PENDING_SUPPLIER_CONFIRMATION")
+    assert booking_res.get("charged_inr") == offer["total_inr"]
+
+    # Customer-facing status text check
+    confirmed_text = harness.status_text(booking_res, offer)
+    assert "None" not in confirmed_text
+    assert "TRV-" in confirmed_text or "REQ-" in confirmed_text
+
+
+def test_integration_live_flight_and_booking_through_backend_call(monkeypatch):
+    """Step 2: Integration test going through backend.call for search_flights with
+    mocked flight results, then create_booking with correct total.
+    Asserts no exception, confirmed status, and no literal 'None' in customer text."""
+    import datetime as dt
+    import fast_flights
+    from tests.test_live_pricing import _make_mock_flight_item
+
+    mock_item = _make_mock_flight_item(airline="Vistara", dep_time=(6, 45), dur=135, stops=0, price=5200)
+    monkeypatch.setattr(fast_flights, "get_flights", lambda *a, **kw: [mock_item])
+
+    b = backend.Backend(config={"live_pricing": True}, seed=42)
+
+    # 1. search_flights through backend.call
+    search_payload = b.call("search_flights", {
+        "origin": "DEL",
+        "destination": "BOM",
+        "date": "2026-12-01",
+        "passengers": 1
+    })
+    assert search_payload.get("error") is None
+    assert len(search_payload["results"]) == 1
+    offer = search_payload["results"][0]
+    assert offer.get("baggage") is None
+    assert offer.get("fare_rule") is None
+
+    # Summary customer-facing text check
+    summary_text = harness.summary(offer, travellers=1)
+    assert "None" not in summary_text
+    assert "Vistara" in summary_text
+
+    # 2. create_booking through backend.call
+    booking_res = b.call("create_booking", {
+        "offer_id": offer["offer_id"],
+        "travelers": 1,
+        "total_price_inr": offer["total_inr"],
+        "customer_confirmed_terms": True,
+    })
+    assert booking_res.get("error") is None
+    assert booking_res.get("status") in ("CONFIRMED", "PENDING_SUPPLIER_CONFIRMATION")
+    assert booking_res.get("charged_inr") == offer["total_inr"]
+
+    # Customer-facing status text check
+    confirmed_text = harness.status_text(booking_res, offer)
+    assert "None" not in confirmed_text
+    assert "TRV-" in confirmed_text or "REQ-" in confirmed_text

@@ -27,6 +27,9 @@ ACCESS_FEATURES = ["step-free entrance", "wheelchair-accessible room", "roll-in 
 PLAIN_AMENITIES = ["free wifi", "restaurant", "24-hour front desk", "airport shuttle", "rooftop cafe", "parking", "elevator", "breakfast buffet"]
 
 
+WRITE_TOOLS = {"create_booking"}
+
+
 class Backend:
     """config keys (all optional):
     fail_search: "timeout" | "empty"        booking_status: "CONFIRMED" | "PENDING" | "FAILED_PAYMENT" | "SOLD_OUT"
@@ -54,7 +57,11 @@ class Backend:
             return fn(**{k: v for k, v in args.items() if v is not None})
         except Exception:
             logger.exception("Tool execution failed for '%s'", name)
-            return {"error": "INTERNAL_ERROR", "message": "The service encountered an error while processing the request"}
+            if name in WRITE_TOOLS:
+                message = "The booking outcome is not confirmed. Please check the booking status before retrying."
+            else:
+                message = "The service encountered an error while processing the request"
+            return {"error": "INTERNAL_ERROR", "message": message}
 
     def _search_failure(self):
         mode = self.cfg.get("fail_search")
