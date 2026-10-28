@@ -1,15 +1,28 @@
 """Mutation testing self-check script for travel.live_pricing.
 
-Applies 14 targeted mutations to travel/live_pricing.py one at a time, runs the
-offline unit test suite (tests/test_live_pricing.py), and reports whether each
-mutation was CAUGHT or SURVIVED, guaranteeing original file restoration.
+Features:
+1. Baseline Gate: Verifies target tests pass on untouched code before mutating.
+2. True Temp-Dir Isolation: Copies the package to a fresh temp directory per mutation,
+   runs pytest inside the temp directory, and automatically cleans it up.
+   The working repository is never modified in place.
+3. Clean Git Check: Refuses to run if travel/live_pricing.py has uncommitted changes.
+4. Strict Pattern Matching: Exits non-zero immediately if any mutation target pattern is not found.
+5. Targeted Scope: Runs only tests/test_live_pricing.py and offer-schema tests.
+6. Self-test: Supports --self-test to prove that a deliberate no-op mutation is reported SURVIVED.
 """
+import argparse
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGET_FILE = ROOT / "travel" / "live_pricing.py"
+
+TARGET_TEST_FILES = ["tests/test_live_pricing.py"]
+if (ROOT / "tests" / "test_offer_schemas.py").exists():
+    TARGET_TEST_FILES.append("tests/test_offer_schemas.py")
 
 MUTATIONS = [
     {
@@ -87,8 +100,8 @@ MUTATIONS = [
     {
         "id": 13,
         "name": "zero-cards -> returns empty success instead of PROVIDER_RESPONSE_UNREADABLE",
-        "target": '"error": "PROVIDER_RESPONSE_UNREADABLE",\n                "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."',
-        "replacement": '"checked_at": now_iso,\n                "results": [],\n                "source": "Google Travel Hotels (Live)",\n                "cached": False',
+        "target": 'if not live_hotels:\n            return {\n                "error": "PROVIDER_RESPONSE_UNREADABLE",\n                "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."\n            }',
+        "replacement": 'if not live_hotels:\n            return {\n                "checked_at": now_iso,\n                "results": [],\n                "source": "Google Travel Hotels (Live)",\n                "cached": is_cached\n            }',
     },
     {
         "id": 14,
@@ -98,69 +111,142 @@ MUTATIONS = [
     },
 ]
 
+SELF_TEST_MUTATION = {
+    "id": 0,
+    "name": "deliberate no-op mutation (checker self-test)",
+    "target": "# Constants for pricing, scraping, limits, and caching",
+    "replacement": "# Constants for pricing, scraping, limits, and caching (no-op mutation)",
+}
 
-def run_mutation_check():
-    original_code = TARGET_FILE.read_text(encoding="utf-8")
-    results = []
+
+def check_git_status():
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "travel/live_pricing.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.stdout.strip():
+        print("❌ [GIT STATUS ERROR] travel/live_pricing.py has uncommitted changes:")
+        print(proc.stdout.strip())
+        print("Please commit or clean working tree before running mutation check.")
+        sys.exit(1)
+
+
+def check_baseline(test_files):
+    print("Verifying baseline test suite on untouched repository...")
+    proc = subprocess.run(
+        ["uv", "run", "pytest"] + test_files + ["-q"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        print("❌ [BASELINE GATE FAILED] Target tests failed on untouched code:")
+        print(proc.stdout)
+        print(proc.stderr)
+        sys.exit(1)
+    print("✅ Baseline gate passed: all target tests green.\n")
+
+
+def execute_mutation_in_temp_dir(mutation, test_files):
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dir = Path(td)
+        shutil.copytree(ROOT / "travel", tmp_dir / "travel")
+        shutil.copytree(ROOT / "tests", tmp_dir / "tests")
+        shutil.copy(ROOT / "pyproject.toml", tmp_dir / "pyproject.toml")
+
+        target_file = tmp_dir / "travel" / "live_pricing.py"
+        code = target_file.read_text(encoding="utf-8")
+
+        target = mutation["target"]
+        replacement = mutation["replacement"]
+
+        if target not in code:
+            print(f"❌ [CONFIG ERROR] Pattern not found for Mutation #{mutation['id']} ({mutation['name']}):")
+            print(f"   Target: {target!r}")
+            sys.exit(1)
+
+        mutated_code = code.replace(target, replacement)
+        target_file.write_text(mutated_code, encoding="utf-8")
+
+        proc = subprocess.run(
+            ["uv", "run", "pytest"] + test_files + ["-q"],
+            cwd=tmp_dir,
+            capture_output=True,
+            text=True,
+        )
+
+        # If tests failed (proc.returncode != 0), the mutation was CAUGHT
+        # If tests passed (proc.returncode == 0), the mutation SURVIVED
+        return proc.returncode != 0
+
+
+def run_self_test(test_files):
+    print("=" * 75)
+    print("  MUTATION CHECKER SELF-TEST (Deliberate No-Op Mutation)")
+    print("=" * 75)
+    check_git_status()
+    check_baseline(test_files)
+
+    is_caught = execute_mutation_in_temp_dir(SELF_TEST_MUTATION, test_files)
+    if not is_caught:
+        print(f"  ❌ [SURVIVED] Mutation # 0: {SELF_TEST_MUTATION['name']}")
+        print("\n" + "=" * 75)
+        print("✅ Self-test PASSED: Deliberate no-op mutation was successfully reported SURVIVED.")
+        print("   This proves the checker correctly identifies non-breaking/surviving mutations.")
+        print("=" * 75)
+        sys.exit(0)
+    else:
+        print(f"  ✅ [CAUGHT]   Mutation # 0: {SELF_TEST_MUTATION['name']}")
+        print("\n" + "=" * 75)
+        print("❌ Self-test FAILED: Deliberate no-op was unexpectedly caught!")
+        print("=" * 75)
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mutation test runner for live_pricing.py")
+    parser.add_argument("--self-test", action="store_true", help="Run self-test with deliberate no-op mutation")
+    args = parser.parse_args()
+
+    if args.self_test:
+        run_self_test(TARGET_TEST_FILES)
+        return
 
     print("=" * 75)
     print("  MUTATION TESTING SELF-CHECK (14 Mutations)")
     print("=" * 75)
 
-    try:
-        for m in MUTATIONS:
-            m_id = m["id"]
-            name = m["name"]
-            target = m["target"]
-            replacement = m["replacement"]
+    check_git_status()
+    check_baseline(TARGET_TEST_FILES)
 
-            if target not in original_code:
-                print(f"❌ [CONFIG ERROR] Mutation #{m_id} target string not found in {TARGET_FILE.name}")
-                results.append((m_id, name, "TARGET_NOT_FOUND"))
-                continue
-
-            # Apply mutation
-            mutated = original_code.replace(target, replacement)
-            TARGET_FILE.write_text(mutated, encoding="utf-8")
-
-            # Run test suite offline
-            proc = subprocess.run(
-                ["uv", "run", "pytest", "tests/test_live_pricing.py", "-q"],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-            )
-
-            # If tests failed, mutation was CAUGHT; if tests passed, it SURVIVED
-            if proc.returncode != 0:
-                print(f"  ✅ [CAUGHT]   Mutation #{m_id:2d}: {name}")
-                results.append((m_id, name, "CAUGHT"))
-            else:
-                print(f"  ❌ [SURVIVED] Mutation #{m_id:2d}: {name}")
-                results.append((m_id, name, "SURVIVED"))
-
-            # Restore original code after each run
-            TARGET_FILE.write_text(original_code, encoding="utf-8")
-
-    finally:
-        # Guarantee restoration under any condition
-        TARGET_FILE.write_text(original_code, encoding="utf-8")
+    results = []
+    for m in MUTATIONS:
+        m_id = m["id"]
+        name = m["name"]
+        caught = execute_mutation_in_temp_dir(m, TARGET_TEST_FILES)
+        if caught:
+            print(f"  ✅ [CAUGHT]   Mutation #{m_id:2d}: {name}")
+            results.append((m_id, name, "CAUGHT"))
+        else:
+            print(f"  ❌ [SURVIVED] Mutation #{m_id:2d}: {name}")
+            results.append((m_id, name, "SURVIVED"))
 
     print("\n" + "=" * 75)
-    caught = sum(1 for _, _, status in results if status == "CAUGHT")
-    survived = sum(1 for _, _, status in results if status == "SURVIVED")
-    errors = sum(1 for _, _, status in results if status == "TARGET_NOT_FOUND")
+    caught_count = sum(1 for _, _, status in results if status == "CAUGHT")
+    survived_count = sum(1 for _, _, status in results if status == "SURVIVED")
 
-    print(f"Summary: {caught}/14 CAUGHT | {survived}/14 SURVIVED | {errors} ERRORS")
+    print(f"Summary: {caught_count}/{len(MUTATIONS)} CAUGHT | {survived_count}/{len(MUTATIONS)} SURVIVED")
     print("=" * 75)
 
-    if survived > 0 or errors > 0 or caught != len(MUTATIONS):
-        print("⚠️ Some mutations survived or failed to run. Additional tests needed.")
+    if survived_count > 0 or caught_count != len(MUTATIONS):
+        print("⚠️ Some mutations survived. Test suite needs strengthening.")
         sys.exit(1)
     else:
-        print("🎉 ALL 14 MUTATIONS CAUGHT! Test suite verification succeeded.")
+        print("🎉 ALL 14 MUTATIONS CAUGHT! Baseline is green and tests are verified.")
         sys.exit(0)
 
 
 if __name__ == "__main__":
-    run_mutation_check()
+    main()
