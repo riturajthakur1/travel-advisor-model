@@ -5,12 +5,15 @@ so the student learns to relay tool results rather than memorise invented facts 
 """
 import datetime as dt
 import json
+import logging
 import os
 import random
 
 import functools
 
 from travel import india, kb
+
+logger = logging.getLogger(__name__)
 
 _KB = functools.lru_cache(maxsize=1)(kb.load)
 
@@ -47,7 +50,11 @@ class Backend:
         fn = getattr(self, name, None)
         if fn is None:
             return {"error": "UNKNOWN_TOOL"}
-        return fn(**{k: v for k, v in args.items() if v is not None})
+        try:
+            return fn(**{k: v for k, v in args.items() if v is not None})
+        except Exception:
+            logger.exception("Tool execution failed for '%s'", name)
+            return {"error": "INTERNAL_ERROR", "message": "The service encountered an error while processing the request"}
 
     def _search_failure(self):
         mode = self.cfg.get("fail_search")
@@ -151,7 +158,7 @@ class Backend:
             return {"status": "FAILED", "reason": "UNKNOWN_OFFER", "charged": False}
         if customer_confirmed_terms is not True:
             return {"status": "FAILED", "reason": "CONFIRMATION_REQUIRED", "charged": False}
-        expected = offer["total_inr"] + offer.get("taxes_estimate_inr", 0)
+        expected = offer["total_inr"] + (offer.get("taxes_estimate_inr") or 0)
         if abs(float(total_price_inr) - expected) > 1 and abs(float(total_price_inr) - offer["total_inr"]) > 1:
             return {"status": "FAILED", "reason": "PRICE_MISMATCH", "current_total_inr": expected, "charged": False}
         status = self.cfg.get("booking_status", "CONFIRMED")

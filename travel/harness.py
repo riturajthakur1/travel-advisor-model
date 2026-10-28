@@ -59,19 +59,27 @@ def _rule(offer):
 
 
 def payable(offer):
-    return int(offer.get("total_inr", 0)) + int(offer.get("taxes_estimate_inr", 0) if offer.get("taxes_included") is False else 0)
+    return int(offer.get("total_inr", 0)) + int((offer.get("taxes_estimate_inr") or 0) if offer.get("taxes_included") is False else 0)
 
 
 def summary(offer, travellers):
     if "hotel" in offer:
-        product = f"{offer['hotel']}, {offer.get('room', 'room')}"
+        room = offer.get("room")
+        product = f"{offer['hotel']}, {room}" if room else offer["hotel"]
         when = (f"{offer['check_in']} to {offer['check_out']} ({offer.get('nights')} nights)" if offer.get("check_in")
                 else f"{offer.get('nights')} nights")
     else:
         product = f"{offer.get('airline', 'Flight')} {offer.get('from', '')} to {offer.get('to', '')}"
         when = f"{offer.get('date', '')} departing {offer.get('departs', '')}".strip()
-    taxes = (f"includes about {inr(offer['taxes_estimate_inr'])} estimated taxes" if offer.get("taxes_included") is False
-             else "taxes included")
+    if offer.get("taxes_included") is True:
+        taxes = "taxes included"
+    elif offer.get("taxes_included") is False:
+        if offer.get("taxes_estimate_inr"):
+            taxes = f"includes about {inr(offer['taxes_estimate_inr'])} estimated taxes"
+        else:
+            taxes = "taxes are extra; the amount is not confirmed"
+    else:
+        taxes = "tax treatment is not confirmed by the provider"
     return (f"Please confirm this booking:\n- {product}\n- {when}\n- Travellers: {travellers}\n"
             f"- Total: {inr(payable(offer))} ({taxes})\n- Cancellation: {_rule(offer)}\n\n"
             "Press Confirm to book, or tell me what you'd like to change.")
