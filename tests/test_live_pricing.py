@@ -8,6 +8,8 @@ import pytest
 from travel import live_pricing
 from travel.offer_schemas import validate_offer
 
+_ORIGINAL_SCRAPE_HOTELS = live_pricing._scrape_live_hotels_google
+
 TODAY_IST = dt.datetime.now(ZoneInfo("Asia/Kolkata")).date()
 DATE_FUTURE_1 = (TODAY_IST + dt.timedelta(days=30)).isoformat()
 DATE_FUTURE_2 = (TODAY_IST + dt.timedelta(days=33)).isoformat()
@@ -234,6 +236,38 @@ def test_hotel_provider_failure_returns_provider_unavailable_without_fake_data(m
     assert res.get("error") == "PROVIDER_UNAVAILABLE"
     assert "Grand Residency" not in str(res)
     assert "Heritage Haveli" not in str(res)
+
+
+def test_provider_error_class_and_http_status_503(monkeypatch):
+    assert hasattr(live_pricing, "ProviderError")
+    assert issubclass(live_pricing.ProviderError, Exception)
+
+    class MockResponse:
+        status_code = 503
+        text = "Service Unavailable"
+
+    mock_client = MagicMock()
+    mock_client.get.return_value = MockResponse()
+    monkeypatch.setattr(live_pricing.primp, "Client", lambda *a, **kw: mock_client)
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", _ORIGINAL_SCRAPE_HOTELS)
+
+    with pytest.raises(live_pricing.ProviderError):
+        live_pricing._scrape_live_hotels_google("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2)
+
+
+def test_hotel_parser_bug_propagates_without_disguise(monkeypatch):
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", MagicMock(side_effect=AttributeError("Parser bug in card selector")))
+    with pytest.raises(AttributeError):
+        live_pricing.search_live_hotels("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=False)
+
+
+def test_flight_create_query_failure_returns_structured_error(monkeypatch):
+    import fast_flights
+    monkeypatch.setattr(fast_flights, "create_query", MagicMock(side_effect=ValueError("Invalid query parameter")))
+
+    res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, use_cache=False)
+    assert res.get("error") == "INVALID_ARGUMENTS"
+    assert "Could not construct flight query" in res["message"]
 
 
 def test_hotel_zero_cards_returns_provider_response_unreadable(monkeypatch):

@@ -37,6 +37,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+class ProviderError(Exception):
+    """Raised when a remote travel provider returns an HTTP error or unexpected status."""
+    pass
+
+
 # Explicit canonical display names for airport codes (single source of truth)
 IATA_TO_CANONICAL = {
     "DEL": "Delhi",
@@ -322,17 +328,22 @@ def search_live_flights(
     if _ff_exceptions and hasattr(_ff_exceptions, "FlightsNotFound"):
         fnf_list.append(getattr(_ff_exceptions, "FlightsNotFound"))
     flights_not_found = tuple(fnf_list)
-    provider_errors = (primp.PrimpError, ConnectionError, TimeoutError, OSError, RuntimeError)
+    provider_errors = (primp.PrimpError, OSError)
 
     passengers_obj = fast_flights.Passengers(adults=pax) if pax > 1 else None
 
     # Fetch outbound flights
-    q_out = fast_flights.create_query(
-        flights=[fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code)],
-        currency="INR",
-        trip="one-way",
-        passengers=passengers_obj
-    )
+    try:
+        q_out = fast_flights.create_query(
+            flights=[fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code)],
+            currency="INR",
+            trip="one-way",
+            passengers=passengers_obj
+        )
+    except Exception as e:
+        logger.exception("Failed to build flight query for %s -> %s on %s: %s", orig_code, dest_code, date, e)
+        return {"error": "INVALID_ARGUMENTS", "message": f"Could not construct flight query: {e}"}
+
     tfs_out = q_out.params().get("tfs")
     try:
         flight_results_out = fast_flights.get_flights(q_out)
@@ -360,12 +371,17 @@ def search_live_flights(
 
     if return_date:
         # For round-trip: fetch return flights and pair them cleanly
-        q_ret = fast_flights.create_query(
-            flights=[fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code)],
-            currency="INR",
-            trip="one-way",
-            passengers=passengers_obj
-        )
+        try:
+            q_ret = fast_flights.create_query(
+                flights=[fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code)],
+                currency="INR",
+                trip="one-way",
+                passengers=passengers_obj
+            )
+        except Exception as e:
+            logger.exception("Failed to build return flight query for %s -> %s on %s: %s", dest_code, orig_code, return_date, e)
+            return {"error": "INVALID_ARGUMENTS", "message": f"Could not construct return flight query: {e}"}
+
         try:
             flight_results_ret = fast_flights.get_flights(q_ret)
         except flights_not_found as e:
@@ -382,8 +398,8 @@ def search_live_flights(
                     passengers=passengers_obj,
                 )
                 tfs_rt = q_rt.params().get("tfs")
-            except Exception:
-                pass
+            except (KeyError, ValueError, AttributeError) as e:
+                logger.warning("Could not generate round-trip tfs link: %s", e)
 
             roundtrip_link = (
                 f"https://www.google.com/travel/flights?tfs={tfs_rt}&curr=INR"
@@ -427,8 +443,8 @@ def search_live_flights(
                 passengers=passengers_obj,
             )
             tfs_rt = q_rt.params().get("tfs")
-        except Exception:
-            pass
+        except (KeyError, ValueError, AttributeError) as e:
+            logger.warning("Could not generate round-trip tfs link: %s", e)
 
         roundtrip_link = (
             f"https://www.google.com/travel/flights?tfs={tfs_rt}&curr=INR"
@@ -639,7 +655,7 @@ def _scrape_live_hotels_google(city: str, check_in: str, check_out: str) -> List
     url = f"https://www.google.com/travel/search?q={query.replace(' ', '+')}&curr=INR"
     res = client.get(url, timeout=12)
     if res.status_code != 200:
-        raise RuntimeError(f"Google Travel returned status {res.status_code}")
+        raise ProviderError(f"Google Travel returned status {res.status_code}")
 
     return _parse_google_travel_hotels(res.text, deep_link_url=url)
 
@@ -701,8 +717,8 @@ def search_live_hotels(
     # Attempt live scraping from Google Travel
     try:
         live_hotels = _scrape_live_hotels_google(clean_city, check_in, check_out)
-    except Exception:
-        logger.exception("Hotel provider search failed for %s from %s to %s", clean_city, check_in, check_out)
+    except (ProviderError, primp.PrimpError, OSError) as e:
+        logger.exception("Hotel provider search failed for %s from %s to %s: %s", clean_city, check_in, check_out, e)
         return {"error": "PROVIDER_UNAVAILABLE", "message": "Hotel search provider is currently unavailable. Please try again later."}
 
     if not live_hotels:
