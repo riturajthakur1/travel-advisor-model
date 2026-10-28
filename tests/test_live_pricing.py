@@ -239,8 +239,8 @@ def test_hotel_provider_failure_returns_provider_unavailable_without_fake_data(m
 
     res = live_pricing.search_live_hotels("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=False)
     assert res.get("error") == "PROVIDER_UNAVAILABLE"
-    assert "Grand Residency" not in str(res)
-    assert "Heritage Haveli" not in str(res)
+    for fake in ["Grand Residency", "Heritage Haveli", "Comfort Stay"]:
+        assert fake not in str(res)
 
 
 def test_provider_error_class_and_http_status_503(monkeypatch):
@@ -292,6 +292,8 @@ def test_hotel_zero_cards_returns_provider_response_unreadable(monkeypatch):
     res = live_pricing.search_live_hotels("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=False)
     assert res.get("error") == "PROVIDER_RESPONSE_UNREADABLE"
     assert "Could not read hotel results from the provider page" in res["message"]
+    for fake in ["Grand Residency", "Heritage Haveli", "Comfort Stay"]:
+        assert fake not in str(res)
 
 
 def test_flight_flights_not_found_returns_clear_message_and_link(monkeypatch):
