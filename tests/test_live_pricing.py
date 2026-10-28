@@ -86,10 +86,17 @@ def test_offer_ids_include_date_to_prevent_cross_date_collisions():
 
 
 @pytest.fixture(autouse=True)
-def mock_cache_db(tmp_path, monkeypatch):
+def mock_cache_db_and_offline_guard(tmp_path, monkeypatch):
     test_db = tmp_path / "test_pricing_cache.db"
     monkeypatch.setattr(live_pricing, "CACHE_DB_PATH", test_db)
     live_pricing._init_cache_db()
+
+    def block_network(*args, **kwargs):
+        raise RuntimeError("Network call attempted in unit test")
+
+    if live_pricing.fast_flights:
+        monkeypatch.setattr(live_pricing.fast_flights, "get_flights", block_network)
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", block_network)
 
 
 def test_flight_provider_failure_returns_provider_unavailable_without_fake_data(monkeypatch):
@@ -349,6 +356,46 @@ def test_fast_flights_missing_handled_gracefully(monkeypatch):
     res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", use_cache=False)
     assert res.get("error") == "PROVIDER_UNAVAILABLE"
     assert "fast-flights" in res["message"] or "unavailable" in res["message"].lower()
+
+
+@pytest.mark.parametrize("bad_pax", [0, 10, -1, "abc", None, 3.5])
+def test_flight_passengers_validation_rejects_non_1_to_9(bad_pax):
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", passengers=bad_pax, use_cache=False)
+    assert res.get("error") == "INVALID_ARGUMENTS"
+    assert "integer between 1 and 9" in res["message"]
+
+
+@pytest.mark.parametrize("bad_guests", [0, 10, -1, "abc", None, 2.5])
+def test_hotel_guests_validation_rejects_non_1_to_9(bad_guests):
+    res = live_pricing.search_live_hotels("Delhi", "2026-11-20", "2026-11-23", guests=bad_guests, use_cache=False)
+    assert res.get("error") == "INVALID_ARGUMENTS"
+    assert "integer between 1 and 9" in res["message"]
+
+
+def test_hotel_offer_id_uses_iata_and_hotel_name_hash(monkeypatch):
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda city, ci, co: [
+        {"hotel": "Rajputana Palace", "price_per_night_inr": 3500, "deep_link": "http://..."},
+        {"hotel": "Desert Camp", "price_per_night_inr": 2800, "deep_link": "http://..."},
+    ])
+
+    res_jaipur = live_pricing.search_live_hotels("Jaipur", "2026-11-20", "2026-11-23", use_cache=False)
+    res_jaisalmer = live_pricing.search_live_hotels("Jaisalmer", "2026-11-20", "2026-11-23", use_cache=False)
+
+    jaipur_id = res_jaipur["results"][0]["offer_id"]
+    jaisalmer_id = res_jaisalmer["results"][0]["offer_id"]
+
+    # Jaipur uses JAI, Jaisalmer uses JSA (no collision to JAI)
+    assert jaipur_id.startswith("H-JAI-")
+    assert jaisalmer_id.startswith("H-JSA-")
+
+    # Hotel IDs use hash of hotel name instead of scrape index
+    assert not jaipur_id.endswith("-1")
+    assert not jaipur_id.endswith("-2")
+
+
+def test_valid_indian_airports_derived_from_iata_to_canonical():
+    assert live_pricing.VALID_INDIAN_AIRPORTS == set(live_pricing.IATA_TO_CANONICAL.keys())
+
 
 
 

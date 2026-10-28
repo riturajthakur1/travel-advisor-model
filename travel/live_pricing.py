@@ -16,13 +16,12 @@ and educational development. Production commercial deployments should use licens
 """
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import logging
-import os
 import pathlib
 import re
 import sqlite3
-import urllib.parse
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -38,60 +37,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Valid Indian airports
-VALID_INDIAN_AIRPORTS = {
-    "DEL", "BOM", "BLR", "GOI", "GOX", "CCU", "MAA", "HYD", "PNQ", "AMD",
-    "JAI", "UDR", "COK", "TRV", "LKO", "IXC", "ATQ", "VNS", "SXR", "IXL",
-    "DED", "IXB", "GAU", "IXZ", "BBI", "IDR", "BHO", "JDH", "JSA", "IXE",
-    "CJB", "IXM", "VTZ", "PAT", "IXR", "AGR", "TIR", "BDQ", "RPR", "NAG",
-    "GWL", "KNU", "BKB", "AJL", "IMF", "DMU", "DIB", "TEZ", "JRH", "IXA"
-}
-
-# Mapping Indian cities to primary airport codes
-CITY_TO_IATA = {
-    "delhi": "DEL", "new delhi": "DEL", "ncr": "DEL",
-    "mumbai": "BOM", "bombay": "BOM",
-    "bengaluru": "BLR", "bangalore": "BLR",
-    "goa": "GOI", "north goa": "GOX", "south goa": "GOI", "dabolim": "GOI", "mopa": "GOX",
-    "kolkata": "CCU", "calcutta": "CCU",
-    "chennai": "MAA", "madras": "MAA",
-    "hyderabad": "HYD",
-    "pune": "PNQ",
-    "ahmedabad": "AMD",
-    "jaipur": "JAI",
-    "udaipur": "UDR",
-    "kochi": "COK", "cochin": "COK",
-    "thiruvananthapuram": "TRV", "trivandrum": "TRV",
-    "lucknow": "LKO",
-    "chandigarh": "IXC",
-    "amritsar": "ATQ",
-    "varanasi": "VNS",
-    "srinagar": "SXR",
-    "leh": "IXL", "ladakh": "IXL",
-    "dehradun": "DED", "rishikesh": "DED", "haridwar": "DED",
-    "bagdogra": "IXB", "darjeeling": "IXB", "siliguri": "IXB",
-    "guwahati": "GAU", "shillong": "GAU",
-    "port blair": "IXZ", "andaman": "IXZ", "havelock island": "IXZ",
-    "bhubaneswar": "BBI", "puri": "BBI",
-    "indore": "IDR",
-    "bhopal": "BHO",
-    "jodhpur": "JDH",
-    "jaisalmer": "JSA",
-    "mangalore": "IXE", "mangaluru": "IXE", "udupi": "IXE",
-    "coimbatore": "CJB", "ooty": "CJB",
-    "madurai": "IXM",
-    "visakhapatnam": "VTZ", "vizag": "VTZ",
-    "patna": "PAT",
-    "ranchi": "IXR",
-    "agra": "AGR",
-    "kanpur": "KNU",
-    "tirupati": "TIR",
-    "vadodara": "BDQ",
-    "raipur": "RPR",
-    "nagpur": "NAG",
-}
-
-# Explicit canonical display names for airport codes
+# Explicit canonical display names for airport codes (single source of truth)
 IATA_TO_CANONICAL = {
     "DEL": "Delhi",
     "BOM": "Mumbai",
@@ -134,32 +80,106 @@ IATA_TO_CANONICAL = {
     "BDQ": "Vadodara",
     "RPR": "Raipur",
     "NAG": "Nagpur",
+    "GWL": "Gwalior",
+    "BKB": "Bikaner",
+    "AJL": "Aizawl",
+    "IMF": "Imphal",
+    "DMU": "Dimapur",
+    "DIB": "Dibrugarh",
+    "TEZ": "Tezpur",
+    "JRH": "Jorhat",
+    "IXA": "Agartala",
+}
+
+# Derived valid Indian airport codes
+VALID_INDIAN_AIRPORTS = set(IATA_TO_CANONICAL.keys())
+
+# Mapping Indian cities to primary airport codes
+CITY_TO_IATA = {
+    "delhi": "DEL", "new delhi": "DEL", "ncr": "DEL",
+    "mumbai": "BOM", "bombay": "BOM",
+    "bengaluru": "BLR", "bangalore": "BLR",
+    "goa": "GOI", "north goa": "GOX", "south goa": "GOI", "dabolim": "GOI", "mopa": "GOX",
+    "kolkata": "CCU", "calcutta": "CCU",
+    "chennai": "MAA", "madras": "MAA",
+    "hyderabad": "HYD",
+    "pune": "PNQ",
+    "ahmedabad": "AMD",
+    "jaipur": "JAI",
+    "jaisalmer": "JSA",
+    "udaipur": "UDR",
+    "kochi": "COK", "cochin": "COK",
+    "thiruvananthapuram": "TRV", "trivandrum": "TRV",
+    "lucknow": "LKO",
+    "chandigarh": "IXC",
+    "amritsar": "ATQ",
+    "varanasi": "VNS",
+    "srinagar": "SXR",
+    "leh": "IXL", "ladakh": "IXL",
+    "dehradun": "DED", "rishikesh": "DED", "haridwar": "DED",
+    "bagdogra": "IXB", "darjeeling": "IXB", "siliguri": "IXB",
+    "guwahati": "GAU", "shillong": "GAU",
+    "port blair": "IXZ", "andaman": "IXZ", "havelock island": "IXZ",
+    "bhubaneswar": "BBI", "puri": "BBI",
+    "indore": "IDR",
+    "bhopal": "BHO",
+    "jodhpur": "JDH",
+    "mangalore": "IXE", "mangaluru": "IXE", "udupi": "IXE",
+    "coimbatore": "CJB", "ooty": "CJB",
+    "madurai": "IXM",
+    "visakhapatnam": "VTZ", "vizag": "VTZ",
+    "patna": "PAT",
+    "ranchi": "IXR",
+    "agra": "AGR",
+    "kanpur": "KNU",
+    "tirupati": "TIR",
+    "vadodara": "BDQ",
+    "raipur": "RPR",
+    "nagpur": "NAG",
+    "gwalior": "GWL",
+    "bikaner": "BKB",
+    "aizawl": "AJL",
+    "imphal": "IMF",
+    "dimapur": "DMU",
+    "dibrugarh": "DIB",
+    "tezpur": "TEZ",
+    "jorhat": "JRH",
+    "agartala": "IXA",
 }
 
 # Cache Database setup
 CACHE_DB_PATH = pathlib.Path(__file__).resolve().parent.parent / "data" / "cache" / "pricing_cache.db"
+_cache_db_initialized = False
 
 
 def _init_cache_db():
-    CACHE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(sqlite3.connect(CACHE_DB_PATH)) as conn:
-        with conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS price_cache (
-                    cache_key TEXT PRIMARY KEY,
-                    category TEXT,
-                    data_json TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
-                )
-            """)
+    """Initializes SQLite cache schema lazily wrapped in try/except."""
+    try:
+        CACHE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(CACHE_DB_PATH)) as conn:
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS price_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        category TEXT,
+                        data_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP
+                    )
+                """)
+    except sqlite3.Error as e:
+        logger.warning("Could not initialize cache database: %s", e)
 
 
-# Run table initialization once on module import
-_init_cache_db()
+def _ensure_cache_db():
+    global _cache_db_initialized
+    if not _cache_db_initialized:
+        _init_cache_db()
+        _cache_db_initialized = True
 
 
 def _get_from_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    _ensure_cache_db()
     try:
         with contextlib.closing(sqlite3.connect(CACHE_DB_PATH)) as conn:
             cur = conn.cursor()
@@ -178,6 +198,7 @@ def _get_from_cache(cache_key: str) -> Optional[Dict[str, Any]]:
 
 
 def _save_to_cache(cache_key: str, category: str, data: Dict[str, Any], ttl_hours: int = 6):
+    _ensure_cache_db()
     try:
         with contextlib.closing(sqlite3.connect(CACHE_DB_PATH)) as conn:
             with conn:
@@ -187,6 +208,23 @@ def _save_to_cache(cache_key: str, category: str, data: Dict[str, Any], ttl_hour
                 """, (cache_key, category, json.dumps(data, ensure_ascii=False), ttl_hours))
     except sqlite3.Error as e:
         logger.warning("Cache write error: %s", e)
+
+
+def _validate_count(val: Any, name: str) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
+    """Validates that a passenger or guest count is strictly an integer between 1 and 9."""
+    if isinstance(val, bool) or val is None:
+        return None, {"error": "INVALID_ARGUMENTS", "message": f"{name} must be an integer between 1 and 9"}
+    try:
+        if isinstance(val, float) and not val.is_integer():
+            return None, {"error": "INVALID_ARGUMENTS", "message": f"{name} must be an integer between 1 and 9"}
+        ival = int(val)
+        if str(val).strip() != str(ival) and not (isinstance(val, (int, float)) and ival == val):
+            return None, {"error": "INVALID_ARGUMENTS", "message": f"{name} must be an integer between 1 and 9"}
+        if 1 <= ival <= 9:
+            return ival, None
+    except (TypeError, ValueError):
+        pass
+    return None, {"error": "INVALID_ARGUMENTS", "message": f"{name} must be an integer between 1 and 9"}
 
 
 def get_current_ist_time() -> str:
@@ -244,13 +282,10 @@ def search_live_flights(
     if orig_code == dest_code:
         return {"error": "INVALID_ARGUMENTS", "message": "Origin and destination cannot be the same airport"}
 
-    # Validate passengers
-    try:
-        pax = int(passengers)
-        if pax < 1:
-            pax = 1
-    except (TypeError, ValueError):
-        pax = 1
+    # Validate passengers strictly (1-9)
+    pax, err = _validate_count(passengers, "passengers")
+    if err:
+        return err
 
     # Validate travel dates
     try:
@@ -577,6 +612,11 @@ def search_live_hotels(
     if not clean_city:
         return {"error": "INVALID_ARGUMENTS", "message": "City name is required"}
 
+    # Validate guests strictly (1-9)
+    guest_count, err = _validate_count(guests, "guests")
+    if err:
+        return err
+
     now_iso = get_current_ist_time()
     today_ist = dt.datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
@@ -603,7 +643,7 @@ def search_live_hotels(
         if cap < 600:
             return {"checked_at": now_iso, "results": [], "message": f"No hotels found at or below ₹{int(cap)} per night"}
 
-    cache_key = f"hotels:{clean_city}:{check_in}:{check_out}:{guests}:{cap}"
+    cache_key = f"hotels:{clean_city}:{check_in}:{check_out}:{guest_count}:{cap}"
     if use_cache:
         cached = _get_from_cache(cache_key)
         if cached:
@@ -625,7 +665,9 @@ def search_live_hotels(
             rate = item["price_per_night_inr"]
             if cap is not None and rate > cap:
                 continue
-            oid = f"H-{clean_city[:3].upper()}-{date_clean}-{idx + 1}"
+            city_code = resolve_iata(clean_city) or clean_city[:3].upper()
+            hotel_hash = hashlib.sha256(item["hotel"].lower().strip().encode("utf-8")).hexdigest()[:6]
+            oid = f"H-{city_code}-{date_clean}-{hotel_hash}"
             results.append(_build_hotel_offer(
                 offer_id=oid,
                 hotel=item["hotel"],
@@ -633,7 +675,7 @@ def search_live_hotels(
                 room=None,
                 price_per_night=rate,
                 nights=nights,
-                guests=guests,
+                guests=guest_count,
                 check_in=check_in,
                 check_out=check_out,
                 amenities=None,
