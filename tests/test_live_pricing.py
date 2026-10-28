@@ -828,6 +828,107 @@ def test_hotel_unfiltered_cache_reuse_across_budgets(monkeypatch):
     assert mock_scrape.call_count == 1, "Scraper should not be called again for same city and dates"
 
 
+def test_hotel_cache_checked_at_equals_original_fetch_time(monkeypatch):
+    mock_hotels = [{"hotel": "Hotel Lotus", "price_per_night_inr": 3500, "deep_link": "http://..."}]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", MagicMock(return_value=mock_hotels))
+
+    time_first = "2026-10-28T10:00+05:30"
+    time_second = "2026-10-28T14:30+05:30"
+
+    times = [time_first, time_second]
+    monkeypatch.setattr(live_pricing, "get_current_ist_time", lambda: times.pop(0) if times else time_second)
+
+    res1 = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res1["cached"] is False
+    assert res1["checked_at"] == time_first
+
+    res2 = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res2["cached"] is True
+    # checked_at on cache hit must reflect the original scrape time, not request time
+    assert res2["checked_at"] == time_first
+
+
+def test_hotel_zero_cards_and_provider_errors_are_not_cached(monkeypatch):
+    mock_hotels = [{"hotel": "Hotel Taj", "price_per_night_inr": 5000, "deep_link": "http://..."}]
+
+    # 1. Zero cards response -> PROVIDER_RESPONSE_UNREADABLE
+    mock_scrape = MagicMock(side_effect=[[], mock_hotels])
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", mock_scrape)
+
+    res_zero = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res_zero.get("error") == "PROVIDER_RESPONSE_UNREADABLE"
+    assert mock_scrape.call_count == 1
+
+    # Second call should scrape again because zero cards is never cached
+    res_retry = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res_retry.get("error") is None
+    assert len(res_retry["results"]) == 1
+    assert mock_scrape.call_count == 2
+
+    # 2. Provider error -> PROVIDER_UNAVAILABLE
+    mock_err_scrape = MagicMock(side_effect=[live_pricing.ProviderError("503"), mock_hotels])
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", mock_err_scrape)
+
+    res_err = live_pricing.search_live_hotels("Mumbai", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res_err.get("error") == "PROVIDER_UNAVAILABLE"
+    assert mock_err_scrape.call_count == 1
+
+    # Second call should scrape again because errors are never cached
+    res_err_retry = live_pricing.search_live_hotels("Mumbai", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res_err_retry.get("error") is None
+    assert len(res_err_retry["results"]) == 1
+    assert mock_err_scrape.call_count == 2
+
+
+def test_hotel_cache_expiry_calls_scraper_again(monkeypatch, tmp_path):
+    mock_hotels = [{"hotel": "Hotel Taj", "price_per_night_inr": 5000, "deep_link": "http://..."}]
+    mock_scrape = MagicMock(return_value=mock_hotels)
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", mock_scrape)
+
+    test_db = tmp_path / "test_pricing_cache.db"
+
+    # Call 1: Miss -> Scrapes
+    res1 = live_pricing.search_live_hotels("Kolkata", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res1["cached"] is False
+    assert mock_scrape.call_count == 1
+
+    # Call 2: Hit -> Reuses cache
+    res2 = live_pricing.search_live_hotels("Kolkata", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res2["cached"] is True
+    assert mock_scrape.call_count == 1
+
+    # Expire cache in SQLite
+    with contextlib.closing(sqlite3.connect(test_db)) as conn:
+        with conn:
+            conn.execute("UPDATE price_cache SET expires_at = datetime('now', '-1 hour')")
+
+    # Call 3: Expired -> Scrapes again
+    res3 = live_pricing.search_live_hotels("Kolkata", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=True)
+    assert res3["cached"] is False
+    assert mock_scrape.call_count == 2
+
+
+def test_flights_cache_hit_returns_original_checked_at(monkeypatch):
+    import fast_flights
+
+    out_item = _make_mock_flight_item(airline="Air India", dep_time=(8, 0), dur=120, stops=0, price=4000)
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(return_value=[out_item]))
+
+    time_first = "2026-10-28T09:00+05:30"
+    time_second = "2026-10-28T15:00+05:30"
+
+    times = [time_first, time_second]
+    monkeypatch.setattr(live_pricing, "get_current_ist_time", lambda: times.pop(0) if times else time_second)
+
+    res1 = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, use_cache=True)
+    assert res1["cached"] is False
+    assert res1["checked_at"] == time_first
+
+    res2 = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, use_cache=True)
+    assert res2["cached"] is True
+    assert res2["checked_at"] == time_first
+
+
 
 
 

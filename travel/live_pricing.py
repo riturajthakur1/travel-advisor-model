@@ -714,11 +714,13 @@ def search_live_hotels(
     cache_key = f"hotels_scrape:{clean_city}:{check_in}:{check_out}"
     live_hotels = None
     is_cached = False
+    data_checked_at = now_iso
 
     if use_cache:
         cached_entry = _get_from_cache(cache_key)
         if cached_entry and isinstance(cached_entry.get("hotels"), list):
             live_hotels = cached_entry["hotels"]
+            data_checked_at = cached_entry.get("checked_at") or now_iso
             is_cached = True
 
     if live_hotels is None:
@@ -735,7 +737,12 @@ def search_live_hotels(
                 "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."
             }
 
-        _save_to_cache(cache_key, "hotels", {"hotels": live_hotels}, ttl_hours=CACHE_TTL_HOURS)
+        _save_to_cache(
+            cache_key,
+            "hotels",
+            {"hotels": live_hotels, "checked_at": now_iso},
+            ttl_hours=CACHE_TTL_HOURS,
+        )
 
     city_code = resolve_iata(clean_city) or clean_city[:3].upper()
     date_clean = check_in.replace("-", "")
@@ -770,7 +777,7 @@ def search_live_hotels(
     # If a cap was specified and all available hotels were above it
     if cap is not None and not results:
         return {
-            "checked_at": now_iso,
+            "checked_at": data_checked_at,
             "results": [],
             "message": f"No hotels found in {clean_city} at or below ₹{int(cap)} per night",
             "source": "Google Travel Hotels (Live)",
@@ -779,7 +786,7 @@ def search_live_hotels(
 
     if not results:
         return {
-            "checked_at": now_iso,
+            "checked_at": data_checked_at,
             "results": [],
             "message": f"No hotels found in {clean_city} for {check_in} to {check_out}",
             "source": "Google Travel Hotels (Live)",
@@ -787,7 +794,7 @@ def search_live_hotels(
         }
 
     return {
-        "checked_at": now_iso,
+        "checked_at": data_checked_at,
         "results": results,
         "source": "Google Travel Hotels (Live)",
         "cached": is_cached
