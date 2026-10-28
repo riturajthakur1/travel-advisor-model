@@ -40,6 +40,7 @@ def mock_cache_db_and_offline_guard(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("city,expected", [
     ("Delhi", "DEL"),
+    ("  delhi ", "DEL"),
     ("New Delhi", "DEL"),
     ("Mumbai", "BOM"),
     ("Goa", "GOI"),
@@ -257,6 +258,17 @@ def test_provider_error_class_and_http_status_503(monkeypatch):
 
     with pytest.raises(live_pricing.ProviderError):
         live_pricing._scrape_live_hotels_google("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2)
+
+    # 200 with 3-card fixture returns parsed list
+    class Mock200Response:
+        status_code = 200
+        text = HTML_3_CARDS_FIXTURE
+
+    mock_client.get.return_value = Mock200Response()
+    hotels = live_pricing._scrape_live_hotels_google("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2)
+    assert len(hotels) == 2
+    assert hotels[0]["hotel"] == "Hotel Low"
+    assert hotels[0]["price_per_night_inr"] == 2500
 
 
 def test_hotel_parser_bug_propagates_without_disguise(monkeypatch):
@@ -613,6 +625,184 @@ def test_card_tag_exact_cwiz_match():
     # Under card.tag == 'c-wiz', <c-wizard> without jscontroller will climb up to body and be discarded
     hotels = live_pricing._parse_google_travel_hotels(html_cwizard)
     assert len(hotels) == 0
+
+
+@pytest.mark.parametrize("return_date,expected_msg", [
+    ("invalid-date", "return_date must be in YYYY-MM-DD format"),
+    ("2026/11/20", "return_date must be in YYYY-MM-DD format"),
+    (DATE_FUTURE_1, "return_date cannot be before departure date"),
+])
+def test_flight_return_date_validation_errors(return_date, expected_msg):
+    res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_2, return_date=return_date, use_cache=False)
+    assert res.get("error") == "INVALID_ARGUMENTS"
+    assert expected_msg in res["message"]
+
+
+@pytest.mark.parametrize("pax,is_valid,expected_count", [
+    ("3", True, 3),
+    (2.0, True, 2),
+    (True, False, None),
+])
+def test_search_live_flights_validate_count_integration(monkeypatch, pax, is_valid, expected_count):
+    import fast_flights
+    out_item = _make_mock_flight_item()
+    monkeypatch.setattr(fast_flights, "get_flights", lambda *a, **kw: [out_item])
+
+    res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, passengers=pax, use_cache=False)
+    if is_valid:
+        assert res.get("error") is None
+        assert res["results"][0]["passengers"] == expected_count
+    else:
+        assert res.get("error") == "INVALID_ARGUMENTS"
+
+
+@pytest.mark.parametrize("guests,is_valid,expected_count", [
+    ("3", True, 3),
+    (2.0, True, 2),
+    (True, False, None),
+])
+def test_search_live_hotels_validate_count_integration(monkeypatch, guests, is_valid, expected_count):
+    mock_hotels = [{"hotel": "Taj Palace", "price_per_night_inr": 5000, "deep_link": "http://..."}]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: mock_hotels)
+
+    res = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, guests=guests, use_cache=False)
+    if is_valid:
+        assert res.get("error") is None
+        assert res["results"][0]["guests"] == expected_count
+    else:
+        assert res.get("error") == "INVALID_ARGUMENTS"
+
+
+def test_flights_cache_behavior(monkeypatch, tmp_path):
+    import fast_flights
+    test_db = tmp_path / "test_pricing_cache.db"
+
+    out_item = _make_mock_flight_item(airline="Air India", dep_time=(8, 0), dur=120, stops=0, price=4000)
+    ret_item = _make_mock_flight_item(airline="IndiGo", dep_time=(17, 0), dur=120, stops=0, price=4500)
+
+    # (a) First call -> cached=False, second identical call -> cached=True
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(return_value=[out_item]))
+    res1 = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, use_cache=True)
+    assert res1.get("error") is None
+    assert res1["cached"] is False
+
+    res2 = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, use_cache=True)
+    assert res2["cached"] is True
+    assert res2["results"][0]["airline"] == "Air India"
+
+    # (b) One-way and round-trip with same dates do not collide
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=[[out_item], [ret_item]]))
+    res_rt = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, return_date=DATE_FUTURE_2, use_cache=True)
+    assert res_rt["cached"] is False
+    assert res_rt["results"][0]["fare_basis"] == "sum_of_one_way_fares"
+
+    # (c) Empty, error, and FlightsNotFound are never saved
+    with contextlib.closing(sqlite3.connect(test_db)) as conn:
+        with conn:
+            conn.execute("DELETE FROM price_cache")
+
+    # Empty
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(return_value=[]))
+    res_empty = live_pricing.search_live_flights("DEL", "GOI", DATE_FUTURE_1, use_cache=True)
+    assert res_empty["results"] == []
+
+    # Error
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=OSError("network failed")))
+    res_err = live_pricing.search_live_flights("DEL", "GOI", DATE_FUTURE_1, use_cache=True)
+    assert res_err.get("error") == "PROVIDER_UNAVAILABLE"
+
+    # FlightsNotFound
+    fnf_cls = getattr(fast_flights, "FlightsNotFound", Exception)
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=fnf_cls("No flights")))
+    res_fnf = live_pricing.search_live_flights("DEL", "GOI", DATE_FUTURE_1, use_cache=True)
+    assert res_fnf["results"] == []
+
+    with contextlib.closing(sqlite3.connect(test_db)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM price_cache WHERE category = 'flights'").fetchone()[0]
+    assert count == 0
+
+
+def test_price_heuristic_current_behaviour():
+    html = """
+    <html><body>
+      <c-wiz>
+        <h2>Hotel Discount</h2>
+        <span><del>₹3,000</del> <span>₹2,500</span></span>
+      </c-wiz>
+    </body></html>
+    """
+    hotels = live_pricing._parse_google_travel_hotels(html)
+    assert len(hotels) == 1
+    # Current heuristic chooses min(valid_prices)
+    assert hotels[0]["price_per_night_inr"] == 2500
+
+
+def test_hotel_parsing_filters_and_deduplication():
+    # (b) card with only ₹250 fee skipped (below floor MIN_HOTEL_PRICE_INR)
+    html_cheap = """
+    <html><body>
+      <c-wiz>
+        <h2>Hotel Cheap Fee</h2>
+        <span>₹250</span>
+      </c-wiz>
+    </body></html>
+    """
+    assert live_pricing._parse_google_travel_hotels(html_cheap) == []
+
+    # (c) duplicate hotel title deduped
+    html_dup = """
+    <html><body>
+      <c-wiz>
+        <h2>Grand Resort</h2>
+        <span>₹3,500</span>
+      </c-wiz>
+      <c-wiz>
+        <h2>Grand Resort</h2>
+        <span>₹4,000</span>
+      </c-wiz>
+    </body></html>
+    """
+    hotels_dup = live_pricing._parse_google_travel_hotels(html_dup)
+    assert len(hotels_dup) == 1
+    assert hotels_dup[0]["hotel"] == "Grand Resort"
+
+    # (d) "Things to do" heading excluded
+    html_things = """
+    <html><body>
+      <c-wiz>
+        <h2>Things to do in Jaipur</h2>
+        <span>₹1,500</span>
+      </c-wiz>
+    </body></html>
+    """
+    assert live_pricing._parse_google_travel_hotels(html_things) == []
+
+    # (e) HTML with no h2 -> []
+    html_no_h2 = "<html><body><div><span>₹2,000</span></div></body></html>"
+    assert live_pricing._parse_google_travel_hotels(html_no_h2) == []
+
+
+def test_hotel_search_pool_limiting_and_total_calculation(monkeypatch):
+    mock_hotels = [
+        {"hotel": f"Hotel {i}", "price_per_night_inr": 2000 + i * 500, "deep_link": "http://..."}
+        for i in range(6)
+    ]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: mock_hotels)
+
+    # Exactly MAX_HOTEL_RESULTS returned
+    res = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=False)
+    assert len(res["results"]) == live_pricing.MAX_HOTEL_RESULTS
+
+    # total_inr == rate * nights
+    for offer in res["results"]:
+        assert offer["total_inr"] == offer["price_per_night_inr"] * offer["nights"]
+        assert offer["nights"] == 3
+
+    # max_price_per_night below MIN_HOTEL_PRICE_INR -> clean empty result
+    res_below_min = live_pricing.search_live_hotels("Delhi", DATE_FUTURE_1, DATE_FUTURE_2, max_price_per_night=500, use_cache=False)
+    assert res_below_min["results"] == []
+    assert "No hotels found at or below ₹500 per night" in res_below_min["message"]
+
 
 
 
