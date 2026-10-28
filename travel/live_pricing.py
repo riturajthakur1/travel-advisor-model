@@ -316,7 +316,12 @@ def search_live_flights(
         logger.error("fast-flights dependency is not installed")
         return {"error": "PROVIDER_UNAVAILABLE", "message": "Flight search provider is currently unavailable (fast-flights dependency missing)."}
 
-    flights_not_found = getattr(_ff_exceptions, "FlightsNotFound", ()) if _ff_exceptions else ()
+    fnf_list = []
+    if fast_flights and hasattr(fast_flights, "FlightsNotFound"):
+        fnf_list.append(getattr(fast_flights, "FlightsNotFound"))
+    if _ff_exceptions and hasattr(_ff_exceptions, "FlightsNotFound"):
+        fnf_list.append(getattr(_ff_exceptions, "FlightsNotFound"))
+    flights_not_found = tuple(fnf_list)
     provider_errors = (primp.PrimpError, ConnectionError, TimeoutError, OSError, RuntimeError)
 
     passengers_obj = fast_flights.Passengers(adults=pax) if pax > 1 else None
@@ -328,15 +333,27 @@ def search_live_flights(
         trip="one-way",
         passengers=passengers_obj
     )
+    tfs_out = q_out.params().get("tfs")
     try:
         flight_results_out = fast_flights.get_flights(q_out)
-    except flights_not_found:
-        flight_results_out = []
+    except flights_not_found as e:
+        logger.warning("Google Flights returned FlightsNotFound (errorHasStatus/no results): %s", e)
+        deep_link = (
+            f"https://www.google.com/travel/flights?tfs={tfs_out}&curr=INR"
+            if tfs_out
+            else f"https://www.google.com/travel/flights?q=oneway+flights+from+{orig_code}+to+{dest_code}+on+{date}&curr=INR"
+        )
+        return {
+            "checked_at": now_iso,
+            "results": [],
+            "message": "Google returned no flight results for this search. This can mean no flights are available or a temporary provider error; check the search link.",
+            "source": "Google Flights (Live)",
+            "cached": False,
+            "deep_link": deep_link,
+        }
     except provider_errors as e:
         logger.exception("Flight provider search failed for %s -> %s on %s: %s", orig_code, dest_code, date, e)
         return {"error": "PROVIDER_UNAVAILABLE", "message": "Flight search provider is currently unavailable. Please try again later."}
-
-    tfs_out = q_out.params().get("tfs")
 
     results = []
     date_clean = date.replace("-", "")
@@ -351,8 +368,36 @@ def search_live_flights(
         )
         try:
             flight_results_ret = fast_flights.get_flights(q_ret)
-        except flights_not_found:
-            flight_results_ret = []
+        except flights_not_found as e:
+            logger.warning("Google Flights returned FlightsNotFound for return query: %s", e)
+            tfs_rt = None
+            try:
+                q_rt = fast_flights.create_query(
+                    flights=[
+                        fast_flights.FlightQuery(date=date, from_airport=orig_code, to_airport=dest_code),
+                        fast_flights.FlightQuery(date=return_date, from_airport=dest_code, to_airport=orig_code),
+                    ],
+                    trip="round-trip",
+                    currency="INR",
+                    passengers=passengers_obj,
+                )
+                tfs_rt = q_rt.params().get("tfs")
+            except Exception:
+                pass
+
+            roundtrip_link = (
+                f"https://www.google.com/travel/flights?tfs={tfs_rt}&curr=INR"
+                if tfs_rt
+                else f"https://www.google.com/travel/flights?q=roundtrip+flights+from+{orig_code}+to+{dest_code}+from+{date}+to+{return_date}&curr=INR"
+            )
+            return {
+                "checked_at": now_iso,
+                "results": [],
+                "message": "Google returned no flight results for this search. This can mean no flights are available or a temporary provider error; check the search link.",
+                "source": "Google Flights (Live)",
+                "cached": False,
+                "deep_link": roundtrip_link,
+            }
         except provider_errors as e:
             logger.exception("Return flight provider search failed for %s -> %s on %s: %s", dest_code, orig_code, return_date, e)
             return {"error": "PROVIDER_UNAVAILABLE", "message": "Return flight search provider is currently unavailable. Please try again later."}
@@ -581,6 +626,9 @@ def _parse_google_travel_hotels(html: str, deep_link_url: str = "") -> List[Dict
         if len(hotels) >= 20:  # Collect candidate pool for filtering
             break
 
+    if not hotels:
+        logger.warning("Could not read hotel results from provider HTML (len=%d); layout may have changed or request was blocked", len(html))
+
     return hotels
 
 
@@ -657,46 +705,51 @@ def search_live_hotels(
         logger.exception("Hotel provider search failed for %s from %s to %s", clean_city, check_in, check_out)
         return {"error": "PROVIDER_UNAVAILABLE", "message": "Hotel search provider is currently unavailable. Please try again later."}
 
+    if not live_hotels:
+        return {
+            "error": "PROVIDER_RESPONSE_UNREADABLE",
+            "message": "Could not read hotel results from the provider page; the layout may have changed or the request was blocked."
+        }
+
     results = []
     date_clean = check_in.replace("-", "")
 
-    if live_hotels:
-        for idx, item in enumerate(live_hotels):
-            rate = item["price_per_night_inr"]
-            if cap is not None and rate > cap:
-                continue
-            city_code = resolve_iata(clean_city) or clean_city[:3].upper()
-            hotel_hash = hashlib.sha256(item["hotel"].lower().strip().encode("utf-8")).hexdigest()[:6]
-            oid = f"H-{city_code}-{date_clean}-{hotel_hash}"
-            results.append(_build_hotel_offer(
-                offer_id=oid,
-                hotel=item["hotel"],
-                city=clean_city,
-                room=None,
-                price_per_night=rate,
-                nights=nights,
-                guests=guest_count,
-                check_in=check_in,
-                check_out=check_out,
-                amenities=None,
-                deep_link=item["deep_link"],
-                is_live=True,
-                rate_rule=None,
-                taxes_included=None,
-                taxes_estimate_inr=None,
-            ))
-            if len(results) >= 4:
-                break
+    for idx, item in enumerate(live_hotels):
+        rate = item["price_per_night_inr"]
+        if cap is not None and rate > cap:
+            continue
+        city_code = resolve_iata(clean_city) or clean_city[:3].upper()
+        hotel_hash = hashlib.sha256(item["hotel"].lower().strip().encode("utf-8")).hexdigest()[:6]
+        oid = f"H-{city_code}-{date_clean}-{hotel_hash}"
+        results.append(_build_hotel_offer(
+            offer_id=oid,
+            hotel=item["hotel"],
+            city=clean_city,
+            room=None,
+            price_per_night=rate,
+            nights=nights,
+            guests=guest_count,
+            check_in=check_in,
+            check_out=check_out,
+            amenities=None,
+            deep_link=item["deep_link"],
+            is_live=True,
+            rate_rule=None,
+            taxes_included=None,
+            taxes_estimate_inr=None,
+        ))
+        if len(results) >= 4:
+            break
 
-        # If a cap was specified and all available hotels were above it
-        if cap is not None and not results:
-            return {
-                "checked_at": now_iso,
-                "results": [],
-                "message": f"No hotels found in {clean_city} at or below ₹{int(cap)} per night",
-                "source": "Google Travel Hotels (Live)",
-                "cached": False
-            }
+    # If a cap was specified and all available hotels were above it
+    if cap is not None and not results:
+        return {
+            "checked_at": now_iso,
+            "results": [],
+            "message": f"No hotels found in {clean_city} at or below ₹{int(cap)} per night",
+            "source": "Google Travel Hotels (Live)",
+            "cached": False
+        }
 
     if not results:
         return {

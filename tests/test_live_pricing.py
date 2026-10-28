@@ -236,16 +236,26 @@ def test_hotel_provider_failure_returns_provider_unavailable_without_fake_data(m
     assert "Heritage Haveli" not in str(res)
 
 
-def test_hotel_empty_results_returns_real_empty_structure(monkeypatch):
+def test_hotel_zero_cards_returns_provider_response_unreadable(monkeypatch):
     monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: [])
 
     res = live_pricing.search_live_hotels("Udaipur", DATE_FUTURE_1, DATE_FUTURE_2, use_cache=False)
-    assert "error" not in res
+    assert res.get("error") == "PROVIDER_RESPONSE_UNREADABLE"
+    assert "Could not read hotel results from the provider page" in res["message"]
+
+
+def test_flight_flights_not_found_returns_clear_message_and_link(monkeypatch):
+    import fast_flights
+
+    err_cls = getattr(fast_flights, "FlightsNotFound", getattr(fast_flights.exceptions, "FlightsNotFound", Exception))
+    monkeypatch.setattr(fast_flights, "get_flights", MagicMock(side_effect=err_cls("Google returned errorHasStatus")))
+
+    res = live_pricing.search_live_flights("DEL", "BOM", DATE_FUTURE_1, use_cache=False)
+    assert res.get("error") is None
     assert res["results"] == []
-    assert "checked_at" in res
-    assert "No hotels found" in res["message"]
-    assert res["cached"] is False
-    assert "Grand Residency" not in str(res)
+    assert res["message"] == "Google returned no flight results for this search. This can mean no flights are available or a temporary provider error; check the search link."
+    assert "deep_link" in res
+    assert "google.com/travel/flights" in res["deep_link"]
 
 
 # --- Live Offers Contain No Invented Fields ---
