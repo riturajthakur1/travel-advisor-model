@@ -334,8 +334,8 @@ def search_live_flights(
                     "fare_per_person_inr": fare_per_person,
                     "passengers": pax,
                     "total_inr": total,
-                    "baggage": "15 kg check-in, 7 kg cabin",
-                    "fare_rule": "Partially refundable; airline change fees apply",
+                    "baggage": None,
+                    "fare_rule": None,
                     "is_live": True,
                     "deep_link": roundtrip_link,
                 })
@@ -370,8 +370,8 @@ def search_live_flights(
                     "fare_per_person_inr": fare_per_person,
                     "passengers": pax,
                     "total_inr": total,
-                    "baggage": "15 kg check-in, 7 kg cabin",
-                    "fare_rule": "Partially refundable; airline change fees apply",
+                    "baggage": None,
+                    "fare_rule": None,
                     "is_live": True,
                     "deep_link": deep_link,
                 })
@@ -404,19 +404,20 @@ def _build_hotel_offer(
     offer_id: str,
     hotel: str,
     city: str,
-    room: str,
-    price_per_night: int,
-    nights: int,
-    guests: int,
-    check_in: str,
-    check_out: str,
-    amenities: List[str],
-    deep_link: str,
-    is_live: bool
+    room: Optional[str] = None,
+    price_per_night: int = 0,
+    nights: int = 1,
+    guests: int = 1,
+    check_in: str = "",
+    check_out: str = "",
+    amenities: Optional[List[str]] = None,
+    deep_link: str = "",
+    is_live: bool = True,
+    rate_rule: Optional[str] = None,
+    taxes_included: Optional[bool] = None,
+    taxes_estimate_inr: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Helper factory for hotel offer dictionaries."""
-    ci = dt.date.fromisoformat(check_in)
-    cancellation_date = (ci - dt.timedelta(days=2)).isoformat()
     total = price_per_night * nights
     return {
         "offer_id": offer_id,
@@ -429,12 +430,12 @@ def _build_hotel_offer(
         "check_in": check_in,
         "check_out": check_out,
         "amenities": amenities,
-        "rate_rule": f"Free cancellation until {cancellation_date} 23:59",
+        "rate_rule": rate_rule,
         "total_inr": total,
-        "taxes_included": True,
-        "taxes_estimate_inr": round(total * 0.12),
+        "taxes_included": taxes_included,
+        "taxes_estimate_inr": taxes_estimate_inr,
         "is_live": is_live,
-        "deep_link": deep_link
+        "deep_link": deep_link,
     }
 
 
@@ -571,15 +572,18 @@ def search_live_hotels(
                 offer_id=oid,
                 hotel=item["hotel"],
                 city=clean_city,
-                room="Standard / Deluxe Room",
+                room=None,
                 price_per_night=rate,
                 nights=nights,
                 guests=guests,
                 check_in=check_in,
                 check_out=check_out,
-                amenities=["free wifi", "room service", "front desk"],
+                amenities=None,
                 deep_link=item["deep_link"],
-                is_live=True
+                is_live=True,
+                rate_rule=None,
+                taxes_included=None,
+                taxes_estimate_inr=None,
             ))
             if len(results) >= 4:
                 break

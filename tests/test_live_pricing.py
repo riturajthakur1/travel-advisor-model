@@ -138,3 +138,46 @@ def test_hotel_empty_results_returns_real_empty_structure(monkeypatch):
     assert res["cached"] is False
     assert "Grand Residency" not in str(res)
 
+
+def test_live_flight_offers_contain_no_invented_fields(monkeypatch):
+    from unittest.mock import MagicMock
+    import fast_flights
+
+    mock_dep = MagicMock()
+    mock_dep.time = (10, 30)
+    mock_flight = MagicMock()
+    mock_flight.departure = mock_dep
+    mock_flight.duration = 120
+
+    mock_result = MagicMock()
+    mock_result.flights = [mock_flight]
+    mock_result.airlines = ["IndiGo"]
+    mock_result.price = 4500
+
+    monkeypatch.setattr(fast_flights, "get_flights", lambda *a, **kw: [mock_result])
+
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", use_cache=False)
+    assert len(res["results"]) > 0
+    for offer in res["results"]:
+        assert offer.get("baggage") is None
+        assert offer.get("fare_rule") is None
+
+
+def test_live_hotel_offers_contain_no_invented_fields(monkeypatch):
+    mock_hotels = [{
+        "hotel": "Lake Palace",
+        "price_per_night_inr": 15000,
+        "deep_link": "https://google.com/travel/..."
+    }]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: mock_hotels)
+
+    res = live_pricing.search_live_hotels("Udaipur", "2026-11-20", "2026-11-23", use_cache=False)
+    assert len(res["results"]) > 0
+    for offer in res["results"]:
+        assert offer.get("room") is None
+        assert offer.get("amenities") is None
+        assert offer.get("rate_rule") is None
+        assert offer.get("taxes_included") is None
+        assert offer.get("taxes_estimate_inr") is None
+
+
