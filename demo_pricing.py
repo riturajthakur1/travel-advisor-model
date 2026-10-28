@@ -5,20 +5,15 @@ Run this script to test live pricing:
 """
 import datetime as dt
 import time
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from travel.live_pricing import search_live_flights, search_live_hotels
-
-
-EXPECTED_FLIGHT_KEYS = {
-    "offer_id", "airline", "from", "to", "date", "departs", "duration_min",
-    "stops", "fare_per_person_inr", "passengers", "total_inr", "baggage", "fare_rule"
-}
-
-EXPECTED_HOTEL_KEYS = {
-    "offer_id", "hotel", "city", "room", "price_per_night_inr", "nights",
-    "guests", "check_in", "check_out", "amenities", "rate_rule", "total_inr"
-}
+from travel.offer_schemas import (
+    FLIGHT_REQUIRED_KEYS,
+    HOTEL_REQUIRED_KEYS,
+    validate_offer,
+)
 
 
 def print_divider(title: str):
@@ -27,21 +22,16 @@ def print_divider(title: str):
     print("=" * 75)
 
 
-def validate_offer_schema(offers, expected_keys, category_name):
+def validate_offer_schema(offers, kind: Literal["flight", "hotel"], roundtrip: bool = False) -> bool:
     if not offers:
-        print(f"ℹ️  No {category_name} offers to validate.")
+        print(f"ℹ️  No {kind} offers to validate.")
         return True
 
     all_valid = True
     for idx, offer in enumerate(offers, 1):
-        if not isinstance(offer, dict):
-            print(f"❌ {category_name} offer [{idx}] is not a dictionary: {offer}")
-            all_valid = False
-            continue
-
-        missing = expected_keys - set(offer.keys())
-        if missing:
-            print(f"❌ {category_name} offer [{idx}] ({offer.get('offer_id')}) missing keys: {missing}")
+        problems = validate_offer(offer, kind=kind, roundtrip=roundtrip)
+        if problems:
+            print(f"❌ {kind.capitalize()} offer [{idx}] ({offer.get('offer_id')}) schema/type violations: {problems}")
             all_valid = False
 
     return all_valid
@@ -86,21 +76,24 @@ def main():
             print(f"      Price: ₹{f.get('fare_per_person_inr', 0):,} per person (Total: ₹{f.get('total_inr', 0):,})")
             print(f"      Baggage: {f.get('baggage')} | Fare rule: {f.get('fare_rule')}")
             if "deep_link" in f:
-                print(f"      🔗 Verified Live Link: {f.get('deep_link')}")
+                print(f"      🔗 Search link: {f.get('deep_link')}")
             print()
 
     # 2. CACHING SPEED TEST
     print_divider("⚡ [TEST 2] SMART CACHE VERIFICATION")
-    print(f"Re-querying exact search ({origin} -> {destination} on {date_flight})...")
-    t0 = time.perf_counter()
-    cached_result = search_live_flights(origin, destination, date_flight, passengers=passengers, use_cache=True)
-    cache_elapsed = time.perf_counter() - t0
-
-    if cached_result.get("cached") is True:
-        print(f"✅ Cache hit! Returned in {cache_elapsed * 1000:.2f} ms")
-        print("💡 Cached response returned with zero network latency.")
+    if "error" in flight_data or not flight_data.get("results"):
+        print("⏭️  Skipping cache-speed test: first flight search returned error or empty results (cache only stores successful results).")
     else:
-        print(f"ℹ️  Cache miss or not cached: {cached_result.get('message', 'New request performed')}")
+        print(f"Re-querying exact search ({origin} -> {destination} on {date_flight})...")
+        t0 = time.perf_counter()
+        cached_result = search_live_flights(origin, destination, date_flight, passengers=passengers, use_cache=True)
+        cache_elapsed = time.perf_counter() - t0
+
+        if cached_result.get("cached") is True:
+            print(f"✅ Cache hit! Returned in {cache_elapsed * 1000:.2f} ms")
+            print("💡 Cached response returned with zero network latency.")
+        else:
+            print(f"ℹ️  Cache miss or not cached: {cached_result.get('message', 'New request performed')}")
 
     # 3. LIVE HOTEL SEARCH TEST
     print_divider("🏨 [TEST 3] LIVE HOTEL SEARCH (GOOGLE TRAVEL)")
@@ -128,7 +121,7 @@ def main():
             print(f"      Rate: ₹{h.get('price_per_night_inr', 0):,} / night | Total for {h.get('nights')} nights: ₹{h.get('total_inr', 0):,}")
             print(f"      Room: {h.get('room')} | Amenities: {h.get('amenities')} | Cancellation: {h.get('rate_rule')}")
             if "deep_link" in h:
-                print(f"      🔗 Live Google Travel Link: {h.get('deep_link')}")
+                print(f"      🔗 Search link: {h.get('deep_link')}")
             print()
 
     # 4. COMPATIBILITY AUDIT WITH AI TOOL CONTRACT
@@ -136,8 +129,8 @@ def main():
     flight_offers = flight_data.get("results", []) if isinstance(flight_data, dict) else []
     hotel_offers = hotel_data.get("results", []) if isinstance(hotel_data, dict) else []
 
-    flight_valid = validate_offer_schema(flight_offers, EXPECTED_FLIGHT_KEYS, "Flight")
-    hotel_valid = validate_offer_schema(hotel_offers, EXPECTED_HOTEL_KEYS, "Hotel")
+    flight_valid = validate_offer_schema(flight_offers, kind="flight", roundtrip=False)
+    hotel_valid = validate_offer_schema(hotel_offers, kind="hotel")
 
     if flight_valid and hotel_valid and (flight_offers or hotel_offers):
         print(f"🎉 100% of examined live offers match expected schema ({len(flight_offers)} flights, {len(hotel_offers)} hotels).")
