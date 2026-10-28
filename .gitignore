@@ -18,3 +18,5 @@ outputs/*/checkpoints/
 # model weights: only the small LoRA adapters are kept (GGUF builds live in GitHub Releases)
 *.safetensors
 !outputs/*/lora/adapter_model.safetensors
+
+.DS_Store
