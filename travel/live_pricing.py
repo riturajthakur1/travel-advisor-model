@@ -483,6 +483,10 @@ def _parse_google_travel_hotels(html: str, deep_link_url: str = "") -> List[Dict
         if not valid_prices:
             continue
 
+        distinct_prices = sorted(set(valid_prices))
+        if len(distinct_prices) > 1:
+            logger.debug("Hotel %s has multiple distinct valid prices: %s", title, distinct_prices)
+
         price_val = min(valid_prices)
         seen.add(title.lower())
         hotels.append({
