@@ -253,3 +253,81 @@ def test_integration_live_flight_and_booking_through_backend_call(monkeypatch):
     confirmed_text = harness.status_text(booking_res, offer)
     assert "None" not in confirmed_text
     assert "TRV-" in confirmed_text or "REQ-" in confirmed_text
+
+
+def test_harness_e2e_internal_error_counter():
+    """Step 4: verify that MonitoredBackend in scripts/harness_e2e.py counts
+    tool calls returning INTERNAL_ERROR and ignores successful calls."""
+    from scripts.harness_e2e import MonitoredBackend
+
+    b = MonitoredBackend(config={}, seed=42)
+    assert b.internal_error_count == 0
+
+    # Failing tool -> returns INTERNAL_ERROR -> increments counter
+    def exploding_tool(**kwargs):
+        raise RuntimeError("boom")
+    b.exploding_tool = exploding_tool
+
+    res = b.call("exploding_tool", {})
+    assert res.get("error") == "INTERNAL_ERROR"
+    assert b.internal_error_count == 1
+
+    # Successful call -> does not increment counter
+    res_normal = b.call("get_entry_requirements", {"passport_country": "in", "destination_country": "ae"})
+    assert res_normal.get("error") is None
+    assert b.internal_error_count == 1
+
+
+def test_backend_call_booking_taxes_excluded_price_tolerance(monkeypatch):
+    """Step 5: search_hotels returning an offer with taxes_included=False and
+    taxes_estimate_inr=2000, testing create_booking with:
+    (a) total_price_inr == offer['total_inr'] (accepted)
+    (b) total_price_inr == offer['total_inr'] + 2000 (accepted)
+    (c) total_price_inr == neither (rejected with PRICE_MISMATCH)"""
+    mock_hotels = [{"hotel": "Taj Lake Palace", "price_per_night_inr": 10000, "deep_link": "http://..."}]
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: mock_hotels)
+
+    b = backend.Backend(config={"live_pricing": True}, seed=42)
+    search_res = b.call("search_hotels", {
+        "city": "Udaipur",
+        "check_in": "2026-12-01",
+        "check_out": "2026-12-03",
+        "guests": 2
+    })
+    offer = search_res["results"][0]
+    # Set taxes_included=False and estimate=2000 to test the tolerance logic
+    offer["taxes_included"] = False
+    offer["taxes_estimate_inr"] = 2000
+    b.offers[offer["offer_id"]] = offer
+
+    total_base = offer["total_inr"]          # 20,000
+    total_with_tax = total_base + 2000       # 22,000
+
+    # (a) total_price_inr == total_base (accepted per current logic)
+    res_a = b.call("create_booking", {
+        "offer_id": offer["offer_id"],
+        "travelers": 2,
+        "total_price_inr": total_base,
+        "customer_confirmed_terms": True,
+    })
+    assert res_a.get("status") == "CONFIRMED"
+
+    # (b) total_price_inr == total_with_tax (accepted per current logic)
+    res_b = b.call("create_booking", {
+        "offer_id": offer["offer_id"],
+        "travelers": 2,
+        "total_price_inr": total_with_tax,
+        "customer_confirmed_terms": True,
+    })
+    assert res_b.get("status") == "CONFIRMED"
+
+    # (c) price that is neither (PRICE_MISMATCH)
+    res_c = b.call("create_booking", {
+        "offer_id": offer["offer_id"],
+        "travelers": 2,
+        "total_price_inr": total_base + 999,
+        "customer_confirmed_terms": True,
+    })
+    assert res_c.get("status") == "FAILED"
+    assert res_c.get("reason") == "PRICE_MISMATCH"
+    assert res_c.get("current_total_inr") == total_with_tax
