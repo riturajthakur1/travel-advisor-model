@@ -21,12 +21,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default="http://127.0.0.1:8091")
     ap.add_argument("--today", default=dt.date.today().isoformat())
+    ap.add_argument("--live", action="store_true", help="Enable live flight and hotel pricing (zero API cost)")
     args = ap.parse_args()
 
     prompt = (ROOT / "prompts" / "runtime_system_prompt.txt").read_text(encoding="utf-8").strip() + deployment_context(args.today)
-    backend = Backend({"now": f"{args.today}T11:00+05:30"}, seed=1)
+    cfg = {"now": f"{args.today}T11:00+05:30"}
+    if args.live:
+        cfg["live_pricing"] = True
+    backend = Backend(cfg, seed=1)
+    mode_text = "LIVE Google Flights & Hotel pricing" if args.live else "mock backend"
     bot = Harness(llm=OpenAIClient(args.server), backend=backend, system_prompt=prompt, today=args.today)
-    print(f"Travel advisor (today {args.today}, mock backend). Type 'quit' to exit.\n")
+    print(f"Travel advisor (today {args.today}, {mode_text}). Type 'quit' to exit.\n")
     while True:
         try:
             text = input("you> ").strip()

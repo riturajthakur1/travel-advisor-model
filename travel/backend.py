@@ -5,6 +5,7 @@ so the student learns to relay tool results rather than memorise invented facts 
 """
 import datetime as dt
 import json
+import os
 import random
 
 import functools
@@ -60,6 +61,12 @@ class Backend:
     def search_flights(self, origin, destination, date, passengers, return_date=None, **_):
         if (f := self._search_failure()):
             return f
+        if os.environ.get("LIVE_PRICING") == "1" or self.cfg.get("live_pricing"):
+            from travel import live_pricing
+            payload = live_pricing.search_live_flights(origin, destination, date, passengers, return_date)
+            for offer in payload.get("results", []):
+                self.offers[offer["offer_id"]] = offer
+            return payload
         pax = max(1, int(passengers)) if str(passengers).isdigit() else 1
         intl = any(f in f"{origin} {destination}".lower() for f in FOREIGN)
         results = []
@@ -83,6 +90,12 @@ class Backend:
     def search_hotels(self, city, check_in, check_out, guests, max_price_per_night=None, **_):
         if (f := self._search_failure()):
             return f
+        if os.environ.get("LIVE_PRICING") == "1" or self.cfg.get("live_pricing"):
+            from travel import live_pricing
+            payload = live_pricing.search_live_hotels(city, check_in, check_out, guests, max_price_per_night)
+            for offer in payload.get("results", []):
+                self.offers[offer["offer_id"]] = offer
+            return payload
         try:
             nights = max(1, (dt.date.fromisoformat(check_out) - dt.date.fromisoformat(check_in)).days)
         except ValueError:

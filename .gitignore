@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .env
 unsloth_compiled_cache/
+data/cache/
+*.db
 
 # large and re-downloadable or regenerable
 data/raw/sgd/

@@ -1,0 +1,140 @@
+"""Unit tests for travel.live_pricing."""
+import datetime as dt
+from zoneinfo import ZoneInfo
+import pytest
+
+from travel import live_pricing
+
+
+def test_resolve_iata_known_cities():
+    assert live_pricing.resolve_iata("Delhi") == "DEL"
+    assert live_pricing.resolve_iata("New Delhi") == "DEL"
+    assert live_pricing.resolve_iata("Mumbai") == "BOM"
+    assert live_pricing.resolve_iata("Goa") == "GOI"
+    assert live_pricing.resolve_iata("North Goa") == "GOX"
+    assert live_pricing.resolve_iata("Udaipur") == "UDR"
+    assert live_pricing.resolve_iata("Kanpur") == "KNU"
+
+
+def test_resolve_iata_rejects_unknown_and_random_3_letters():
+    assert live_pricing.resolve_iata("xyz") is None
+    assert live_pricing.resolve_iata("XYZ") is None
+    assert live_pricing.resolve_iata("UnknownCity") is None
+    assert live_pricing.resolve_iata("") is None
+    assert live_pricing.resolve_iata(None) is None
+
+
+def test_resolve_iata_valid_known_airport_codes():
+    assert live_pricing.resolve_iata("DEL") == "DEL"
+    assert live_pricing.resolve_iata("BOM") == "BOM"
+    assert live_pricing.resolve_iata("GOI") == "GOI"
+    assert live_pricing.resolve_iata("GOX") == "GOX"
+
+
+def test_iata_canonical_mapping_no_collisions():
+    assert live_pricing.IATA_TO_CANONICAL["DEL"] == "Delhi"
+    assert live_pricing.IATA_TO_CANONICAL["BOM"] == "Mumbai"
+    assert live_pricing.IATA_TO_CANONICAL["CJB"] == "Coimbatore"
+    assert live_pricing.IATA_TO_CANONICAL["GOI"] == "Goa (Dabolim)"
+    assert live_pricing.IATA_TO_CANONICAL["GOX"] == "Goa (Mopa)"
+
+
+def test_flight_validation_rejects_past_dates():
+    res = live_pricing.search_live_flights("DEL", "BOM", "2020-01-01", use_cache=False)
+    assert "error" in res
+    assert "past" in res["message"].lower()
+
+
+def test_flight_validation_rejects_invalid_date_format():
+    res = live_pricing.search_live_flights("DEL", "BOM", "not-a-date", use_cache=False)
+    assert "error" in res
+    assert "YYYY-MM-DD" in res["message"]
+
+
+def test_flight_validation_rejects_unknown_airports():
+    res = live_pricing.search_live_flights("NonExistentCity", "BOM", "2026-11-20", use_cache=False)
+    assert res.get("error") == "UNKNOWN_AIRPORT"
+
+
+def test_flight_validation_rejects_same_origin_and_dest():
+    res = live_pricing.search_live_flights("DEL", "Delhi", "2026-11-20", use_cache=False)
+    assert res.get("error") == "INVALID_ARGUMENTS"
+
+
+def test_hotel_validation_rejects_bad_dates():
+    res = live_pricing.search_live_hotels("Udaipur", "not-a-date", "2026-11-25", use_cache=False)
+    assert res.get("error") == "INVALID_ARGUMENTS"
+
+    # check_out before check_in
+    res2 = live_pricing.search_live_hotels("Udaipur", "2026-11-25", "2026-11-20", use_cache=False)
+    assert res2.get("error") == "INVALID_ARGUMENTS"
+    assert "strictly after" in res2["message"]
+
+
+def test_hotel_budget_cap_under_all_options_returns_clean_empty():
+    # Searching with max_price_per_night=500 (lower than any valid hotel)
+    res = live_pricing.search_live_hotels("Udaipur", "2026-11-20", "2026-11-23", max_price_per_night=500, use_cache=False)
+    assert "results" in res
+    assert len(res["results"]) == 0
+    assert "message" in res
+
+
+def test_offer_ids_include_date_to_prevent_cross_date_collisions():
+    offer1 = live_pricing._build_hotel_offer("H-UDR-20261120-1", "Hotel A", "Udaipur", "Deluxe", 2000, 2, 2, "2026-11-20", "2026-11-22", [], "http://...", True)
+    offer2 = live_pricing._build_hotel_offer("H-UDR-20261210-1", "Hotel A", "Udaipur", "Deluxe", 2000, 2, 2, "2026-12-10", "2026-12-12", [], "http://...", True)
+    assert offer1["offer_id"] != offer2["offer_id"]
+
+
+@pytest.fixture(autouse=True)
+def mock_cache_db(tmp_path, monkeypatch):
+    test_db = tmp_path / "test_pricing_cache.db"
+    monkeypatch.setattr(live_pricing, "CACHE_DB_PATH", test_db)
+    live_pricing._init_cache_db()
+
+
+def test_flight_provider_failure_returns_provider_unavailable_without_fake_data(monkeypatch):
+    import fast_flights
+    def raise_err(*args, **kwargs):
+        raise ConnectionError("Network down")
+    monkeypatch.setattr(fast_flights, "get_flights", raise_err)
+
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", use_cache=False)
+    assert res.get("error") == "PROVIDER_UNAVAILABLE"
+    assert "IndiGo" not in str(res)
+
+
+def test_flight_empty_results_returns_real_empty_structure(monkeypatch):
+    import fast_flights
+    monkeypatch.setattr(fast_flights, "get_flights", lambda *a, **kw: [])
+
+    res = live_pricing.search_live_flights("DEL", "BOM", "2026-11-20", use_cache=False)
+    assert "error" not in res
+    assert res["results"] == []
+    assert "checked_at" in res
+    assert "No flights found" in res["message"]
+    assert res["cached"] is False
+    assert "IndiGo" not in str(res)
+
+
+def test_hotel_provider_failure_returns_provider_unavailable_without_fake_data(monkeypatch):
+    def raise_err(*args, **kwargs):
+        raise ConnectionError("Google Travel down")
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", raise_err)
+
+    res = live_pricing.search_live_hotels("Udaipur", "2026-11-20", "2026-11-23", use_cache=False)
+    assert res.get("error") == "PROVIDER_UNAVAILABLE"
+    assert "Grand Residency" not in str(res)
+    assert "Heritage Haveli" not in str(res)
+
+
+def test_hotel_empty_results_returns_real_empty_structure(monkeypatch):
+    monkeypatch.setattr(live_pricing, "_scrape_live_hotels_google", lambda *a, **kw: [])
+
+    res = live_pricing.search_live_hotels("Udaipur", "2026-11-20", "2026-11-23", use_cache=False)
+    assert "error" not in res
+    assert res["results"] == []
+    assert "checked_at" in res
+    assert "No hotels found" in res["message"]
+    assert res["cached"] is False
+    assert "Grand Residency" not in str(res)
+
