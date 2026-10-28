@@ -549,6 +549,58 @@ def test_hotel_card_scoping_with_three_cards():
     assert hotels[1]["price_per_night_inr"] == 7800
 
 
+def test_named_constants_defined():
+    assert live_pricing.MIN_HOTEL_PRICE_INR == 600
+    assert live_pricing.MAX_HOTEL_PRICE_INR == 300_000
+    assert live_pricing.HOTEL_CANDIDATE_POOL == 20
+    assert live_pricing.MAX_HOTEL_RESULTS == 4
+    assert live_pricing.MAX_FLIGHT_RESULTS == 4
+    assert live_pricing.CACHE_TTL_HOURS == 6
+    assert live_pricing.HTTP_TIMEOUT_S == 12
+
+
+@pytest.mark.parametrize("val,expected_num,should_succeed", [
+    (3, 3, True),
+    ("3", 3, True),
+    ("  3  ", 3, True),
+    (2.0, 2, True),
+    (True, None, False),
+    (False, None, False),
+    (None, None, False),
+    ("abc", None, False),
+    (3.5, None, False),
+    (0, None, False),
+    (10, None, False),
+    (-1, None, False),
+    ("-1", None, False),
+])
+def test_validate_count_cases(val, expected_num, should_succeed):
+    num, err = live_pricing._validate_count(val, "count")
+    if should_succeed:
+        assert err is None
+        assert num == expected_num
+        assert type(num) is int
+    else:
+        assert num is None
+        assert err is not None
+        assert err.get("error") == "INVALID_ARGUMENTS"
+
+
+def test_card_tag_exact_cwiz_match():
+    html_cwizard = """
+    <html><body>
+      <c-wizard>
+        <h2>Hotel Wizard</h2>
+        <span>₹4,000</span>
+      </c-wizard>
+    </body></html>
+    """
+    # Under card.tag == 'c-wiz', <c-wizard> without jscontroller will climb up to body and be discarded
+    hotels = live_pricing._parse_google_travel_hotels(html_cwizard)
+    assert len(hotels) == 0
+
+
+
 @pytest.mark.skip(reason="needs real saved response")
 def test_real_google_travel_sample_fixture_if_present():
     import pathlib

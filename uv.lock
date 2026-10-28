@@ -829,6 +829,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fast-flights" },
+    { name = "primp" },
+    { name = "selectolax" },
     { name = "tzdata" },
 ]
 
@@ -841,7 +843,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fast-flights", specifier = ">=3.1.0" },
+    { name = "fast-flights", specifier = "==3.1.0" },
+    { name = "primp", specifier = "==2.0.1" },
+    { name = "selectolax", specifier = "==1.0.2" },
     { name = "tzdata", specifier = ">=2025.1" },
 ]
 
